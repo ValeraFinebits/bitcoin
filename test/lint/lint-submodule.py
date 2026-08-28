@@ -11,11 +11,12 @@ This script checks for git modules
 import subprocess
 import sys
 
+
 def main():
-    submodules_list = subprocess.check_output(['git', 'submodule', 'status', '--recursive'],
-                                                text = True).rstrip('\n')
-    if submodules_list:
-        print("These submodules were found, delete them:\n", submodules_list)
+    submodules = subprocess.check_output(['git', 'submodule', 'status', '--recursive'], text=True).splitlines()
+    invalid = [entry for entry in submodules if entry[0] in '+U' or entry.split()[1] != 'payjoin']
+    if invalid:
+        print("These unexpected or modified submodules were found:\n", '\n'.join(invalid))
         sys.exit(1)
     sys.exit(0)
 
