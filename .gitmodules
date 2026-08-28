@@ -1,0 +1,3 @@
+[submodule "payjoin"]
+	path = payjoin
+	url = https://github.com/payjoin/rust-payjoin.git
