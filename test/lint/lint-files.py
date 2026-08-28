@@ -40,8 +40,8 @@ class FileMeta(object):
         # 100755 5a150d5f8031fcd75e80a4dd9843afa33655f579 0       ci/test/00_setup_env.sh
         meta, self.file_path = file_spec.split('\t', 2)
         meta = meta.split()
-        # The octal file permission of the file. Internally, git only
-        # keeps an 'executable' bit, so this will always be 0o644 or 0o755.
+        # Git stores regular-file modes as 100644 or 100755 and gitlinks as 160000.
+        self.is_submodule = meta[0] == "160000"
         self.permissions = int(meta[0], 8) & 0o7777
         # We don't currently care about the other fields
 
@@ -128,6 +128,8 @@ def check_all_file_permissions(files) -> int:
     """
     failed_tests = 0
     for filename, file_meta in files.items():
+        if file_meta.is_submodule:
+            continue
         if file_meta.permissions == ALLOWED_PERMISSION_EXECUTABLES:
             with open(filename, "rb") as f:
                 shebang = f.readline().rstrip(b"\n")
@@ -178,6 +180,8 @@ def check_shebang_file_permissions(files_meta) -> int:
     failed_tests = 0
     for filename in filenames:
         file_meta = files_meta[filename]
+        if file_meta.is_submodule:
+            continue
         if file_meta.permissions != ALLOWED_PERMISSION_EXECUTABLES:
             # These file types are typically expected to be sourced and not executed directly
             if file_meta.full_extension in ["bash", "init", "openrc", "sh.in"]:
