@@ -3,6 +3,8 @@ Bitcoin Core integration/staging tree
 
 https://bitcoincore.org
 
+This fork includes experimental Payjoin support via the Rust-Payjoin library.
+
 For an immediately usable, binary version of the Bitcoin Core software, see
 https://bitcoincore.org/en/download/.
 
