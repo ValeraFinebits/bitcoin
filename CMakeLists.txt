@@ -116,6 +116,7 @@ cmake_dependent_option(BUILD_KERNEL_TEST "Build tests for the experimental bitco
 
 option(ENABLE_WALLET "Enable wallet." ON)
 cmake_dependent_option(BUILD_WALLET_TOOL "Build bitcoin-wallet tool." ${BUILD_TESTS} "ENABLE_WALLET" OFF)
+cmake_dependent_option(ENABLE_PAYJOIN "Enable embedded Payjoin support." OFF "ENABLE_WALLET" OFF)
 
 option(ENABLE_EXTERNAL_SIGNER "Enable external signer support." ON)
 option(WITH_ZMQ "Enable ZMQ notifications." OFF)
@@ -675,6 +676,7 @@ message("  libbitcoinkernel (experimental) ..... ${BUILD_KERNEL_LIB}")
 message("  kernel-test (experimental) .......... ${BUILD_KERNEL_TEST}")
 message("Optional features:")
 message("  wallet support ...................... ${ENABLE_WALLET}")
+message("  Payjoin support ...................... ${ENABLE_PAYJOIN}")
 message("  external signer ..................... ${ENABLE_EXTERNAL_SIGNER}")
 message("  ZeroMQ .............................. ${WITH_ZMQ}")
 if(ENABLE_IPC)

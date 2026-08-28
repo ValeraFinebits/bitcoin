@@ -141,6 +141,9 @@ add_executable(test_bitcoin
   validationinterface_tests.cpp
   versionbits_tests.cpp
 )
+if(ENABLE_PAYJOIN)
+  target_sources(test_bitcoin PRIVATE payjoin_tests.cpp)
+endif()
 
 include(TargetDataSources)
 target_json_data_sources(test_bitcoin
