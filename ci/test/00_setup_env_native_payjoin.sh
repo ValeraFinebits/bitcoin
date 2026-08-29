@@ -12,7 +12,8 @@ export APT_LLVM_V="17"
 export PACKAGES="clang-${APT_LLVM_V} llvm-${APT_LLVM_V} libboost-dev libsqlite3-dev"
 export NO_DEPENDS=1
 export GOAL="all"
-export CARGO_BUILD_JOBS="$(nproc)"
+CARGO_BUILD_JOBS="$(nproc)"
+export CARGO_BUILD_JOBS
 export RUN_FUNCTIONAL_TESTS=false
 export BITCOIN_CONFIG="\
  -DCMAKE_BUILD_TYPE=Debug \
