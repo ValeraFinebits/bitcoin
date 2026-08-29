@@ -161,6 +161,10 @@ include(InstallBinaryComponent)
 if(ENABLE_WALLET)
   add_subdirectory(wallet)
 
+  if(ENABLE_PAYJOIN)
+    add_subdirectory(payjoin)
+  endif()
+
   if(BUILD_WALLET_TOOL)
     add_executable(bitcoin-wallet
       bitcoin-wallet.cpp
@@ -294,9 +298,6 @@ target_link_libraries(bitcoin_node
     $<TARGET_NAME_IF_EXISTS:Boost::headers>
     $<TARGET_NAME_IF_EXISTS:USDT::headers>
 )
-if(ENABLE_PAYJOIN)
-  add_subdirectory(payjoin)
-endif()
 if(WITH_EMBEDDED_ASMAP)
   target_compile_definitions(bitcoin_node PRIVATE ENABLE_EMBEDDED_ASMAP=1)
   include(TargetDataSources)

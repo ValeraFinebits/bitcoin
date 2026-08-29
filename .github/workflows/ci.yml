@@ -143,6 +143,7 @@ jobs:
         with:
           # Ensure the latest merged pull request state is used, even on re-runs.
           ref: &CHECKOUT_REF_TMPL ${{ github.event_name == 'pull_request' && github.ref || '' }}
+          submodules: ${{ matrix.checkout-submodules && 'recursive' || 'false' }}
 
       - name: Clang version
         run: |
@@ -491,6 +492,13 @@ jobs:
             fallback-runner: 'ubuntu-latest'
             timeout-minutes: 120
             file-env: './ci/test/00_setup_env_native_nowallet.sh'
+
+          - name: 'Payjoin, native Linux'
+            warp-runner: 'warp-ubuntu-latest-x64-4x'
+            fallback-runner: 'ubuntu-latest'
+            timeout-minutes: 120
+            file-env: './ci/test/00_setup_env_native_payjoin.sh'
+            checkout-submodules: true
 
           - name: 'i686, no IPC'
             warp-runner: 'warp-ubuntu-latest-x64-8x'

@@ -92,5 +92,5 @@ target_link_libraries(bitcoin_payjoin_ffi
   PRIVATE "${PAYJOIN_RUST_STATIC}" Threads::Threads ${CMAKE_DL_LIBS} m rt util
 )
 
-target_sources(bitcoin_node PRIVATE client.cpp)
-target_link_libraries(bitcoin_node PRIVATE bitcoin_payjoin_ffi)
+target_sources(bitcoin_wallet PRIVATE client.cpp)
+target_link_libraries(bitcoin_wallet PRIVATE bitcoin_payjoin_ffi)
