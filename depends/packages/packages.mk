@@ -26,7 +26,5 @@ multiprocess_native_packages = native_libmultiprocess native_capnp
 
 usdt_linux_packages=systemtap
 
-ifeq ($(PAYJOIN),1)
-packages += payjoin_ffi
-native_packages += native_payjoin_bindgen
-endif
+payjoin_linux_packages=payjoin_ffi
+payjoin_linux_native_packages=native_payjoin_bindgen
