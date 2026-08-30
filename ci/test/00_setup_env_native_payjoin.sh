@@ -10,10 +10,10 @@ export CONTAINER_NAME=ci_native_payjoin
 export CI_IMAGE_NAME_TAG="mirror.gcr.io/rust:1.85.1-bookworm"
 export APT_LLVM_V="17"
 export PACKAGES="clang-${APT_LLVM_V} llvm-${APT_LLVM_V} libboost-dev libsqlite3-dev"
-export NO_DEPENDS=1
+export PAYJOIN=1
 export GOAL="all"
-CARGO_BUILD_JOBS="$(nproc)"
-export CARGO_BUILD_JOBS
+export MAKEJOBS="-j4"
+export CARGO_BUILD_JOBS=4
 export RUN_FUNCTIONAL_TESTS=false
 export BITCOIN_CONFIG="\
  -DCMAKE_BUILD_TYPE=Debug \
