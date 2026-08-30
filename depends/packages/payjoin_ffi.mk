@@ -29,16 +29,15 @@ endef
 
 define $(package)_build_cmds
   RUSTUP_TOOLCHAIN=$(payjoin_ffi_details_rust_toolchain) \
-  CARGO_BUILD_JOBS=4 \
-  CARGO_TARGET_DIR="$($(package)_build_dir)/cargo-target" \
+  CARGO_TARGET_DIR="$(payjoin_ffi_details_cargo_target_dir)" \
   cargo build \
     --package payjoin-ffi \
     --lib \
     --release \
     --locked \
     --no-default-features && \
-  test -s "$($(package)_build_dir)/cargo-target/release/libpayjoin_ffi.a" && \
-  test -s "$($(package)_build_dir)/cargo-target/release/libpayjoin_ffi.so" && \
+  test -s "$(payjoin_ffi_details_cargo_target_dir)/release/libpayjoin_ffi.a" && \
+  test -s "$(payjoin_ffi_details_cargo_target_dir)/release/libpayjoin_ffi.so" && \
   rm -rf "$($(package)_build_dir)/generated-cpp" && \
   mkdir -p "$($(package)_build_dir)/generated-cpp" && \
   cd "$($(package)_build_dir)/payjoin-ffi" && \
@@ -46,7 +45,7 @@ define $(package)_build_cmds
   RUSTUP_TOOLCHAIN=$(payjoin_ffi_details_rust_toolchain) \
   UNIFFI_BINDGEN_LANGUAGE=cpp \
   $(build_prefix)/bin/uniffi-bindgen \
-    --library "$($(package)_build_dir)/cargo-target/release/libpayjoin_ffi.so" \
+    --library "$(payjoin_ffi_details_cargo_target_dir)/release/libpayjoin_ffi.so" \
     --out-dir "$($(package)_build_dir)/generated-cpp" \
     --skip-async && \
   test -f "$($(package)_build_dir)/generated-cpp/payjoin.cpp" && \
@@ -67,11 +66,11 @@ define $(package)_build_cmds
 endef
 
 define $(package)_stage_cmds
-  test -f "$($(package)_build_dir)/cargo-target/release/libpayjoin_ffi.a" && \
-  test -s "$($(package)_build_dir)/cargo-target/release/libpayjoin_ffi.a" && \
+  test -f "$(payjoin_ffi_details_cargo_target_dir)/release/libpayjoin_ffi.a" && \
+  test -s "$(payjoin_ffi_details_cargo_target_dir)/release/libpayjoin_ffi.a" && \
   mkdir -p "$($(package)_staging_prefix_dir)/lib/cmake/PayjoinFFI" && \
   mkdir -p "$($(package)_staging_prefix_dir)/share/payjoin/cpp" && \
-  cp "$($(package)_build_dir)/cargo-target/release/libpayjoin_ffi.a" "$($(package)_staging_prefix_dir)/lib/" && \
+  cp "$(payjoin_ffi_details_cargo_target_dir)/release/libpayjoin_ffi.a" "$($(package)_staging_prefix_dir)/lib/" && \
   cp "$($(package)_patch_dir)/PayjoinFFIConfig.cmake" \
     "$($(package)_staging_prefix_dir)/lib/cmake/PayjoinFFI/PayjoinFFIConfig.cmake" && \
   cp "$($(package)_build_dir)/generated-cpp/payjoin.cpp" \
