@@ -20,8 +20,7 @@ endef
 
 define $(package)_build_cmds
   RUSTUP_TOOLCHAIN=$(payjoin_ffi_details_rust_toolchain) \
-  CARGO_BUILD_JOBS=4 \
-  CARGO_TARGET_DIR="$($(package)_build_dir)/cargo-target" \
+  CARGO_TARGET_DIR="$(payjoin_ffi_details_cargo_target_dir)" \
   cargo build \
     --package payjoin-ffi \
     --bin uniffi-bindgen \
@@ -32,10 +31,10 @@ define $(package)_build_cmds
 endef
 
 define $(package)_stage_cmds
-  test -f "$($(package)_build_dir)/cargo-target/release/uniffi-bindgen" && \
-  test -s "$($(package)_build_dir)/cargo-target/release/uniffi-bindgen" && \
+  test -f "$(payjoin_ffi_details_cargo_target_dir)/release/uniffi-bindgen" && \
+  test -s "$(payjoin_ffi_details_cargo_target_dir)/release/uniffi-bindgen" && \
   mkdir -p "$($(package)_staging_prefix_dir)/bin" && \
-  cp "$($(package)_build_dir)/cargo-target/release/uniffi-bindgen" \
+  cp "$(payjoin_ffi_details_cargo_target_dir)/release/uniffi-bindgen" \
     "$($(package)_staging_prefix_dir)/bin/uniffi-bindgen" && \
   chmod 755 "$($(package)_staging_prefix_dir)/bin/uniffi-bindgen" && \
   test -f "$($(package)_staging_prefix_dir)/bin/uniffi-bindgen" && \
