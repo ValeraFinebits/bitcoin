@@ -40,6 +40,7 @@ NO_QR ?=
 NO_WALLET ?=
 NO_ZMQ ?=
 NO_USDT ?=
+PAYJOIN ?=
 # Default NO_IPC value is 1 on Windows
 NO_IPC ?= $(if $(findstring mingw32,$(HOST)),1,)
 LTO ?=
@@ -163,9 +164,11 @@ wallet_packages_$(NO_WALLET) = $(sqlite_packages)
 zmq_packages_$(NO_ZMQ) = $(zmq_packages)
 ipc_packages_$(NO_IPC) = $(ipc_packages)
 usdt_packages_$(NO_USDT) = $(usdt_$(host_os)_packages)
+payjoin_packages_1 = $(payjoin_$(host_os)_packages)
+payjoin_native_packages_1 = $(payjoin_$(host_os)_native_packages)
 
-packages += $($(host_arch)_$(host_os)_packages) $($(host_os)_packages) $(boost_packages_) $(qt_packages_) $(wallet_packages_) $(usdt_packages_)
-native_packages += $($(host_arch)_$(host_os)_native_packages) $($(host_os)_native_packages) $(qt_native_packages_)
+packages += $($(host_arch)_$(host_os)_packages) $($(host_os)_packages) $(boost_packages_) $(qt_packages_) $(wallet_packages_) $(usdt_packages_) $(payjoin_packages_$(PAYJOIN))
+native_packages += $($(host_arch)_$(host_os)_native_packages) $($(host_os)_native_packages) $(qt_native_packages_) $(payjoin_native_packages_$(PAYJOIN))
 
 ifneq ($(zmq_packages_),)
 packages += $(zmq_packages)
@@ -174,6 +177,24 @@ endif
 ifneq ($(ipc_packages_),)
 packages += $(ipc_packages)
 native_packages += $(multiprocess_native_packages)
+endif
+
+ifneq ($(PAYJOIN),)
+ifneq ($(PAYJOIN),1)
+$(error PAYJOIN must be empty or 1)
+endif
+endif
+
+ifeq ($(PAYJOIN),1)
+ifneq ($(NO_WALLET),)
+$(error PAYJOIN=1 requires wallet support)
+endif
+ifeq ($(payjoin_packages_1),)
+$(error PAYJOIN=1 is not supported for host $(host))
+endif
+ifneq ($(host),$(build))
+$(error PAYJOIN currently supports native builds only)
+endif
 endif
 
 all_packages = $(packages) $(native_packages)
@@ -230,6 +251,7 @@ $(host_prefix)/toolchain.cmake : toolchain.cmake.in $(host_prefix)/.stamp_$(fina
             -e 's|@qrencode_packages@|$(qrencode_packages_)|' \
             -e 's|@zmq_packages@|$(zmq_packages_)|' \
             -e 's|@wallet_packages@|$(wallet_packages_)|' \
+            -e 's|@payjoin_packages@|$(payjoin_packages_$(PAYJOIN))|' \
             -e 's|@usdt_packages@|$(usdt_packages_)|' \
             -e 's|@ipc_packages@|$(ipc_packages_)|' \
             $< > $@
