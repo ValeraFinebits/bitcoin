@@ -27,21 +27,13 @@ define $(package)_build_cmds
     --release \
     --locked \
     --no-default-features \
-    --features cpp
+    --features cpp && \
+  test -s "$(payjoin_ffi_details_cargo_target_dir)/release/uniffi-bindgen"
 endef
 
 define $(package)_stage_cmds
-  test -f "$(payjoin_ffi_details_cargo_target_dir)/release/uniffi-bindgen" && \
-  test -s "$(payjoin_ffi_details_cargo_target_dir)/release/uniffi-bindgen" && \
   mkdir -p "$($(package)_staging_prefix_dir)/bin" && \
   cp "$(payjoin_ffi_details_cargo_target_dir)/release/uniffi-bindgen" \
     "$($(package)_staging_prefix_dir)/bin/uniffi-bindgen" && \
-  chmod 755 "$($(package)_staging_prefix_dir)/bin/uniffi-bindgen" && \
-  test -f "$($(package)_staging_prefix_dir)/bin/uniffi-bindgen" && \
-  test -s "$($(package)_staging_prefix_dir)/bin/uniffi-bindgen" && \
-  test -x "$($(package)_staging_prefix_dir)/bin/uniffi-bindgen" && \
-  find "$($(package)_staging_prefix_dir)" -mindepth 1 \
-    ! -path "$($(package)_staging_prefix_dir)/bin" \
-    ! -path "$($(package)_staging_prefix_dir)/bin/uniffi-bindgen" \
-    -exec false {} +
+  chmod 755 "$($(package)_staging_prefix_dir)/bin/uniffi-bindgen"
 endef
