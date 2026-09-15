@@ -5,6 +5,7 @@
 #ifndef BITCOIN_PAYJOIN_CLIENT_H
 #define BITCOIN_PAYJOIN_CLIENT_H
 
+#include <primitives/transaction.h>
 #include <psbt.h>
 #include <util/expected.h>
 
@@ -14,6 +15,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <variant>
 #include <vector>
 
 class CFeeRate;
@@ -46,23 +48,51 @@ struct SenderRequest {
     std::vector<unsigned char> body;
 };
 
-struct SenderResponse {
-    std::optional<PartiallySignedTransaction> proposal;
+enum class SenderPhase {
+    Initial,
+    Polling,
+    PendingFallback,
+    Closed,
+    Unusable,
 };
+
+struct SenderPosted {
+};
+
+struct SenderNoProposalYet {
+};
+
+struct SenderProposal {
+    PartiallySignedTransaction psbt;
+};
+
+using SenderResponse = std::variant<SenderPosted, SenderNoProposalYet, SenderProposal>;
+
+struct SenderSuccessWithoutProposal {
+    PayjoinError error;
+};
+
+struct SenderAborted {
+    std::optional<PayjoinError> diagnostic;
+};
+
+struct SenderUnknownOutcome {
+    PayjoinError error;
+};
+
+/** Protocol success does not confirm signing or broadcast. Aborted does not
+ * establish whether the fallback transaction was broadcast. */
+using SenderOutcome = std::variant<SenderProposal, SenderSuccessWithoutProposal, SenderAborted, SenderUnknownOutcome>;
 
 /**
  * Synchronous persistence backend for a sender session.
  *
- * Each SenderEventLog object represents one journal. SenderSession retains
- * shared ownership and an exclusive claim for its lifetime. The caller may
- * retain the same shared_ptr for a later Replay(), but cannot use the object in
- * another live session. Shared ownership does not make callbacks
- * concurrent-safe; they are invoked synchronously by session methods and
- * remain part of the session's single-owner interaction.
- *
- * The in-process claim coordinates one SenderEventLog object. A production
- * backend must additionally enforce exclusivity across distinct handles or
- * processes referring to the same durable journal.
+ * Each object represents one journal. SenderSession retains shared ownership
+ * and an exclusive claim for its lifetime; callers may retain it for later
+ * Replay(). Backends must enforce exclusivity across other handles or processes
+ * accessing the same journal.
+ * Callbacks run synchronously and must not re-enter the invoking session
+ * (including queries), move it, or destroy it.
  */
 class SenderEventLog
 {
@@ -71,6 +101,7 @@ public:
 
     virtual util::Expected<void, std::string> Save(std::string event) = 0;
     virtual util::Expected<std::vector<std::string>, std::string> Load() = 0;
+    /** Close idempotently, preserving Load() for later Replay(). */
     virtual util::Expected<void, std::string> Close() = 0;
 
 private:
@@ -79,63 +110,104 @@ private:
 };
 
 /**
- * Move-only sender workflow state.
+ * Move-only, non-thread-safe sender workflow with one execution owner.
  *
- * SenderSession is not thread-safe. It must belong to one execution owner, and
- * its methods and event-log callbacks must not run concurrently. A pending
- * OHTTP context is one-shot and is consumed only by its matching response or
- * discarded explicitly. After a move, the source object is inactive and its
- * PrepareRequest(), ProcessResponse(), and DiscardPendingRequest() methods
- * return InvalidState; the destination retains the workflow state.
+ * Methods and event-log callbacks must not run concurrently. A pending OHTTP
+ * context is one-shot: process its matching response or discard it explicitly.
+ * After a move, instance methods returning Expected return InvalidState,
+ * Phase() returns Unusable, HasPendingRequest() returns false, and Outcome()
+ * and LastError() return nullopt.
  */
 class SenderSession
 {
 public:
     /**
-     * Create a sender session using an unclaimed, empty event log.
-     * min_fee_rate must be positive. Use Replay() for a non-empty log.
+     * Create with an unclaimed, empty writable journal and positive min_fee_rate.
+     * Normalize PSBTv2 to v0 before checking finalized inputs and the UTXO data
+     * required by FinalizeAndExtractPSBT(); extraction does not guarantee signature validity.
+     * URI expiration is checked by PrepareRequest().
+     *
+     * Save() may fail after persisting Created. Inspect the journal before retrying;
+     * recover non-empty logs with Replay().
      */
-    static util::Expected<SenderSession, PayjoinError> Create(
+    [[nodiscard]] static util::Expected<SenderSession, PayjoinError> Create(
         std::string_view uri,
         const PartiallySignedTransaction& psbt,
         const CFeeRate& min_fee_rate,
         std::shared_ptr<SenderEventLog> event_log);
     /**
-     * Reconstruct the last durably written sender state from an unclaimed log.
+     * Restore the last durable state from an unclaimed journal; it may lag
+     * processed responses. Do not automatically resend the original PSBT.
+     * Expired non-Closed sessions return Expired without a session or fallback;
+     * Closed sessions remain replayable. See PrepareRequest() for recovery records.
      *
-     * The recovered state may precede a response that was already processed
-     * before a storage failure. Replay alone does not authorize automatically
-     * resending the original PSBT; the caller must apply an explicit recovery
-     * policy.
+     * Terminal replay calls Close(); successful nonterminal replay does not.
+     * Failed replay may close empty or invalid journals. Close errors return
+     * Storage with the callback reason and no session, possibly after closure.
+     * Replay() adds no events and does not broadcast transactions.
      */
-    static util::Expected<SenderSession, PayjoinError> Replay(std::shared_ptr<SenderEventLog> event_log);
+    [[nodiscard]] static util::Expected<SenderSession, PayjoinError> Replay(std::shared_ptr<SenderEventLog> event_log);
 
-    util::Expected<SenderRequest, PayjoinError> PrepareRequest(std::string_view relay);
     /**
-     * Process the response to an initial BIP77 request.
+     * Prepare the next BIP77 request. Check the HTTP(S) prefix case-insensitively
+     * and pass the relay unchanged to Rust for parsing. Missing or unsupported
+     * prefixes return InvalidUri; expiration returns Expired; other construction
+     * errors return Internal. InvalidState takes precedence over relay errors.
+     * Returned errors leave session state and the journal unchanged.
      *
-     * Only a response for an initial WithReplyKey request is supported. A
-     * successful response persists the transition and moves the session to
-     * PollingForProposal, but returns no proposal yet. Polling responses and
-     * proposal extraction are not implemented.
-     *
-     * The maximum response body size is 1 MiB. A larger response returns
-     * Transient before calling the FFI. Once processing of an initial response
-     * is attempted, its pending OHTTP context becomes invalid: Rust may consume
-     * it in the FFI, or C++ may discard it before the FFI for an oversized
-     * response. After a transient result, the sender remains usable, but only a
-     * new request with a new OHTTP context may be prepared.
-     *
-     * Fatal, storage, and internal errors make this C++ object unusable. A
-     * storage error also leaves the transition result unknown; Replay()
-     * reconstructs only the last durably written state, which may precede the
-     * processed response. The caller must not automatically replay and resend
-     * the original PSBT without a separate recovery policy. Calling this method
-     * for a polling request returns InvalidState without consuming its pending
-     * context; call DiscardPendingRequest() explicitly in that case.
+     * Before sending the first request (encrypted signed PSBT), persist the signed
+     * original and payment/session records, and account for it as outgoing.
+     * The receiver may broadcast the original even if the response is lost.
+     * SenderPosted confirms delivery only.
      */
-    util::Expected<SenderResponse, PayjoinError> ProcessResponse(std::span<const unsigned char> response);
-    util::Expected<void, PayjoinError> DiscardPendingRequest();
+    [[nodiscard]] util::Expected<SenderRequest, PayjoinError> PrepareRequest(std::string_view relay);
+    /**
+     * Process the pending BIP77 response; return InvalidState if none is pending.
+     * Initial responses return SenderPosted and enter Polling. Polling responses
+     * return SenderNoProposalYet or close with SenderProposal containing PSBTv0.
+     *
+     * Processing invalidates the pending OHTTP context, including on errors.
+     * Responses over 1 MiB return Transient before FFI processing. Transient
+     * leaves the session usable, but requires preparing a new request.
+     *
+     * Fatal closes as SenderAborted with a LastError() diagnostic. Storage makes
+     * the session Unusable and leaves the durable transition uncertain; see Replay().
+     * Internal also makes it Unusable, except proposal decoding failure after
+     * persisted success: this leaves Closed with SenderSuccessWithoutProposal
+     * and LastError()==Internal. Do not rewrite the successful journal as Aborted.
+     */
+    [[nodiscard]] util::Expected<SenderResponse, PayjoinError> ProcessResponse(std::span<const unsigned char> response);
+    [[nodiscard]] util::Expected<void, PayjoinError> DiscardPendingRequest();
+
+    SenderPhase Phase() const;
+    bool HasPendingRequest() const;
+    /** Return the terminal outcome, if the session is Closed. */
+    std::optional<SenderOutcome> Outcome() const;
+    /**
+     * Return the current object's diagnostic, not a persisted error history.
+     * Replay() does not restore abort diagnostics but may rediscover decode errors.
+     */
+    std::optional<PayjoinError> LastError() const;
+
+    /**
+     * Return the original signed transaction in every phase, including Unusable;
+     * moved-from objects return InvalidState. Reconcile wallet records before
+     * broadcast or handoff. After success with a proposal, use it for reconciliation
+     * only: broadcasting it conflicts with the Payjoin transaction's inputs.
+     */
+    [[nodiscard]] util::Expected<CTransactionRef, PayjoinError> FallbackTransaction() const;
+
+    /**
+     * Persist PendingFallback from Initial or Polling with no pending request.
+     * CloseFallback() is still required if canceled before sending; the caller
+     * may abandon the payment without broadcasting.
+     */
+    [[nodiscard]] util::Expected<void, PayjoinError> Cancel();
+    /**
+     * Close a PendingFallback session after fallback broadcast or handoff;
+     * Rust treats both as terminal fallback completion.
+     */
+    [[nodiscard]] util::Expected<void, PayjoinError> CloseFallback();
 
     SenderSession(SenderSession&&) noexcept;
     SenderSession& operator=(SenderSession&&) noexcept;
