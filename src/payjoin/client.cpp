@@ -11,6 +11,7 @@
 #include <util/check.h>
 #include <util/overloaded.h>
 #include <util/strencodings.h>
+#include <util/string.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -20,6 +21,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -54,6 +56,12 @@ public:
 
     SenderEventLogLease(const SenderEventLogLease&) = delete;
     SenderEventLogLease& operator=(const SenderEventLogLease&) = delete;
+
+    SenderEventLog& Get() const
+    {
+        Assert(m_event_log != nullptr);
+        return *m_event_log;
+    }
 
 private:
     explicit SenderEventLogLease(std::shared_ptr<SenderEventLog> event_log)
@@ -172,7 +180,16 @@ struct PollingPendingState {
     PendingOhttpContext context;
 };
 
+struct PendingFallbackState {
+    NonNullFfiHandle<::payjoin::SenderPendingFallback> sender;
+};
+
+struct ClosedState {
+    SenderOutcome outcome;
+};
+
 struct UnusableState {
+    std::optional<PayjoinError> error;
 };
 
 using State = std::variant<
@@ -180,7 +197,18 @@ using State = std::variant<
     InitialPendingState,
     PollingReadyState,
     PollingPendingState,
+    PendingFallbackState,
+    ClosedState,
     UnusableState>;
+
+static_assert(std::is_nothrow_move_constructible_v<State>);
+static_assert(std::is_nothrow_move_assignable_v<State>);
+
+util::Expected<void, PayjoinError> FailUnusable(State& state, PayjoinError error)
+{
+    state = State{UnusableState{error}};
+    return util::Unexpected<PayjoinError>{std::move(error)};
+}
 
 constexpr std::size_t MAX_PAYJOIN_RESPONSE_BYTES{1U << 20}; // 1 MiB
 
@@ -203,7 +231,7 @@ bool SameUnsignedTransaction(const CMutableTransaction& lhs, const CMutableTrans
 
 util::Expected<PartiallySignedTransaction, PayjoinError> NormalizePsbtV2ForFfi(const PartiallySignedTransaction& psbt)
 {
-    if (psbt.m_tx_modifiable.has_value()) {
+    if (psbt.m_tx_modifiable && (psbt.m_tx_modifiable->test(0) || psbt.m_tx_modifiable->test(1))) {
         return Failure<PartiallySignedTransaction>(PayjoinErrorCode::InvalidSenderInput, "Payjoin PSBTv2 transaction modifiable flags cannot be represented in PSBTv0");
     }
 
@@ -242,27 +270,72 @@ util::Expected<PartiallySignedTransaction, PayjoinError> NormalizePsbtV2ForFfi(c
     return normalized;
 }
 
-util::Expected<std::string, PayjoinError> SerializePsbtForFfi(const PartiallySignedTransaction& psbt)
+util::Expected<PartiallySignedTransaction, PayjoinError> NormalizeToPsbtV0(const PartiallySignedTransaction& psbt)
+{
+    if (psbt.GetVersion() == 2) return NormalizePsbtV2ForFfi(psbt);
+    if (psbt.GetVersion() != 0) {
+        return Failure<PartiallySignedTransaction>(PayjoinErrorCode::InvalidPsbt, "Payjoin PSBT version is not supported by the FFI adapter");
+    }
+    return psbt;
+}
+
+util::Expected<PartiallySignedTransaction, PayjoinError> NormalizeToPsbtV0(PartiallySignedTransaction&& psbt)
+{
+    if (psbt.GetVersion() == 0) return std::move(psbt);
+    return NormalizeToPsbtV0(psbt);
+}
+
+util::Expected<std::string, PayjoinError> SerializePsbtV0ForFfi(const PartiallySignedTransaction& psbt)
 {
     try {
-        const PartiallySignedTransaction* ffi_psbt{&psbt};
-        std::optional<PartiallySignedTransaction> normalized;
-        if (psbt.GetVersion() == 2) {
-            auto result = NormalizePsbtV2ForFfi(psbt);
-            if (!result) return util::Unexpected<PayjoinError>{std::move(result).error()};
-            normalized.emplace(std::move(result).value());
-            ffi_psbt = &*normalized;
-        } else if (psbt.GetVersion() != 0) {
-            return Failure<std::string>(PayjoinErrorCode::InvalidPsbt, "Payjoin PSBT version is not supported by the FFI adapter");
-        }
-
         DataStream stream{};
-        stream << *ffi_psbt;
+        stream << psbt;
         return EncodeBase64(stream);
     } catch (const std::bad_alloc&) {
         throw;
     } catch (const std::exception&) {
         return Failure<std::string>(PayjoinErrorCode::Internal, "Payjoin PSBT could not be serialized for FFI");
+    }
+}
+
+util::Expected<PartiallySignedTransaction, PayjoinError> DecodeProposalBase64(std::string_view base64)
+{
+    try {
+        auto result = DecodeBase64PSBT(std::string{base64});
+        if (result) {
+            auto normalized = NormalizeToPsbtV0(std::move(result.value()));
+            if (normalized) return std::move(normalized).value();
+        }
+        return Failure<PartiallySignedTransaction>(
+            PayjoinErrorCode::Internal,
+            "Payjoin proposal PSBT could not be decoded (" +
+                util::ToString(base64.size()) +
+                " base64 chars); the Closed event in the session log holds the proposal");
+    } catch (const std::bad_alloc&) {
+        throw;
+    } catch (const std::exception&) {
+        return Failure<PartiallySignedTransaction>(
+            PayjoinErrorCode::Internal,
+            "Payjoin proposal PSBT decoding failed (" +
+                util::ToString(base64.size()) +
+                " base64 chars); the Closed event in the session log holds the proposal");
+    }
+}
+
+util::Expected<CTransactionRef, PayjoinError> DecodeFallbackTransaction(std::span<const unsigned char> bytes)
+{
+    try {
+        CMutableTransaction transaction;
+        SpanReader stream{bytes};
+        stream >> TX_WITH_WITNESS(transaction);
+        if (!stream.empty()) {
+            return Failure<CTransactionRef>(PayjoinErrorCode::Internal, "Payjoin fallback transaction contains extra data");
+        }
+        return MakeTransactionRef(std::move(transaction));
+    } catch (const std::bad_alloc&) {
+        throw;
+    } catch (const std::exception&) {
+        return Failure<CTransactionRef>(PayjoinErrorCode::Internal, "Payjoin fallback transaction could not be decoded");
     }
 }
 
@@ -325,10 +398,9 @@ public:
         SenderEventLogAdapter& m_adapter;
     };
 
-    explicit SenderEventLogAdapter(std::shared_ptr<SenderEventLog> event_log)
-        : m_event_log(std::move(event_log))
+    explicit SenderEventLogAdapter(SenderEventLogLease event_log_lease)
+        : m_event_log_lease(std::move(event_log_lease))
     {
-        Assume(m_event_log != nullptr);
     }
 
     Invocation BeginInvocation() { return Invocation{*this}; }
@@ -337,7 +409,7 @@ public:
     {
         CheckInvocation();
         try {
-            const auto result = m_event_log->Save(event);
+            const auto result = m_event_log_lease.Get().Save(event);
             if (result) return;
             RecordFailure(CallbackFailure::Operation::Save, result.error());
         } catch (const std::exception& exception) {
@@ -352,7 +424,7 @@ public:
     {
         CheckInvocation();
         try {
-            auto result = m_event_log->Load();
+            auto result = m_event_log_lease.Get().Load();
             if (result) return std::move(result).value();
             RecordFailure(CallbackFailure::Operation::Load, result.error());
         } catch (const std::exception& exception) {
@@ -367,7 +439,7 @@ public:
     {
         CheckInvocation();
         try {
-            const auto result = m_event_log->Close();
+            const auto result = m_event_log_lease.Get().Close();
             if (result) return;
             RecordFailure(CallbackFailure::Operation::Close, result.error());
         } catch (const std::exception& exception) {
@@ -402,7 +474,7 @@ private:
         ThrowForeignInternalError(m_failure->message);
     }
 
-    std::shared_ptr<SenderEventLog> m_event_log;
+    SenderEventLogLease m_event_log_lease;
     std::optional<CallbackFailure> m_failure;
     bool m_invocation_active{false};
 };
@@ -411,6 +483,69 @@ PayjoinError PersistenceError(const SenderEventLogAdapter::Invocation& invocatio
 {
     if (auto error = invocation.GetError()) return std::move(*error);
     return MakeError(fallback_code, fallback_message);
+}
+
+PayjoinError MakeFatalDiagnostic(const ::payjoin::sender_persisted_error::Fatal& fatal)
+{
+    constexpr const char* GENERIC_MESSAGE{"Payjoin response was fatally rejected"};
+    try {
+        if (!fatal.v1) return MakeError(PayjoinErrorCode::Fatal, GENERIC_MESSAGE);
+
+        const auto* sender_error = fatal.v1.get();
+        if (const auto* decapsulation = dynamic_cast<const ::payjoin::sender_error::Decapsulation*>(sender_error)) {
+            if (!decapsulation->v1) return MakeError(PayjoinErrorCode::Fatal, GENERIC_MESSAGE);
+            return MakeError(PayjoinErrorCode::Fatal, "Payjoin response was fatally rejected: response decapsulation failed");
+        }
+
+        const auto* response = dynamic_cast<const ::payjoin::sender_error::Response*>(sender_error);
+        if (!response || !response->v1) return MakeError(PayjoinErrorCode::Fatal, GENERIC_MESSAGE);
+
+        if (const auto* well_known = dynamic_cast<const ::payjoin::response_error::WellKnown*>(response->v1.get())) {
+            if (!well_known->v1) return MakeError(PayjoinErrorCode::Fatal, GENERIC_MESSAGE);
+            switch (well_known->v1->code()) {
+            case ::payjoin::ErrorCode::kUnavailable:
+                return MakeError(PayjoinErrorCode::Fatal, "Payjoin response was fatally rejected: receiver error code Unavailable");
+            case ::payjoin::ErrorCode::kNotEnoughMoney:
+                return MakeError(PayjoinErrorCode::Fatal, "Payjoin response was fatally rejected: receiver error code NotEnoughMoney");
+            case ::payjoin::ErrorCode::kVersionUnsupported:
+                return MakeError(PayjoinErrorCode::Fatal, "Payjoin response was fatally rejected: receiver error code VersionUnsupported");
+            case ::payjoin::ErrorCode::kOriginalPsbtRejected:
+                return MakeError(PayjoinErrorCode::Fatal, "Payjoin response was fatally rejected: receiver error code OriginalPsbtRejected");
+            case ::payjoin::ErrorCode::kUnrecognized:
+                return MakeError(PayjoinErrorCode::Fatal, GENERIC_MESSAGE);
+            }
+        }
+
+        if (const auto* validation = dynamic_cast<const ::payjoin::response_error::Validation*>(response->v1.get())) {
+            if (!validation->v1) return MakeError(PayjoinErrorCode::Fatal, GENERIC_MESSAGE);
+            return MakeError(PayjoinErrorCode::Fatal, "Payjoin response was fatally rejected: response validation failed");
+        }
+        return MakeError(PayjoinErrorCode::Fatal, GENERIC_MESSAGE);
+    } catch (const std::bad_alloc&) {
+        throw;
+    } catch (const std::exception&) {
+        return MakeError(PayjoinErrorCode::Fatal, GENERIC_MESSAGE);
+    } catch (...) {
+        return MakeError(PayjoinErrorCode::Fatal, GENERIC_MESSAGE);
+    }
+}
+
+util::Expected<void, PayjoinError> CloseReplayedEventLog(const std::shared_ptr<SenderEventLogAdapter>& adapter)
+{
+    auto invocation = adapter->BeginInvocation();
+    try {
+        adapter->close();
+        if (auto error = invocation.GetError()) return util::Unexpected<PayjoinError>{std::move(*error)};
+        return {};
+    } catch (const ::payjoin::ForeignError&) {
+        return util::Unexpected<PayjoinError>{PersistenceError(invocation, PayjoinErrorCode::Storage, "Payjoin event log could not be closed")};
+    } catch (const std::bad_alloc&) {
+        throw;
+    } catch (const std::exception&) {
+        return util::Unexpected<PayjoinError>{PersistenceError(invocation, PayjoinErrorCode::Storage, "Payjoin event log could not be closed")};
+    } catch (...) {
+        return Failure<void>(PayjoinErrorCode::Storage, "Payjoin event log could not be closed");
+    }
 }
 
 util::Expected<void, PayjoinError> RequireEmptyEventLog(const std::shared_ptr<SenderEventLogAdapter>& adapter)
@@ -520,17 +655,48 @@ PayjoinError MapReplayError(::payjoin::SenderReplayError& error)
     return MakeError(PayjoinErrorCode::ReplayFailed, "Payjoin sender event log could not be replayed");
 }
 
-util::Expected<State, PayjoinError> ReplayState(const std::shared_ptr<SenderEventLogAdapter>& adapter)
+struct ReplayedState {
+    State state;
+    CTransactionRef fallback_tx;
+};
+
+ClosedState MakeClosedState(::payjoin::SenderSessionOutcome& outcome)
+{
+    if (!outcome.is_success()) {
+        if (outcome.is_aborted()) return ClosedState{SenderAborted{std::nullopt}};
+        return ClosedState{
+            SenderUnknownOutcome{MakeError(PayjoinErrorCode::Internal, "Payjoin replay returned an unknown session outcome")}};
+    }
+
+    const auto psbt_base64 = outcome.success_psbt_base64();
+    if (!psbt_base64) {
+        return ClosedState{
+            SenderSuccessWithoutProposal{MakeError(PayjoinErrorCode::Internal, "Payjoin closed success has no proposal PSBT")}};
+    }
+    auto proposal = DecodeProposalBase64(*psbt_base64);
+    if (!proposal) {
+        auto error = std::move(proposal).error();
+        return ClosedState{SenderSuccessWithoutProposal{std::move(error)}};
+    }
+    return ClosedState{SenderProposal{std::move(proposal).value()}};
+}
+
+util::Expected<ReplayedState, PayjoinError> ReplayState(const std::shared_ptr<SenderEventLogAdapter>& adapter)
 {
     auto invocation = adapter->BeginInvocation();
     try {
         auto replay_result = ::payjoin::replay_sender_event_log(adapter);
         if (auto error = invocation.GetError()) return util::Unexpected<PayjoinError>{std::move(*error)};
-        if (!replay_result) return Failure<State>(PayjoinErrorCode::Internal, "Payjoin replay result is empty");
+        if (!replay_result) return Failure<ReplayedState>(PayjoinErrorCode::Internal, "Payjoin replay result is empty");
         auto checked_replay = NonNullFfiHandle<::payjoin::SenderReplayResult>::FromChecked(std::move(replay_result));
 
+        auto history = checked_replay->session_history();
+        if (!history) return Failure<ReplayedState>(PayjoinErrorCode::Internal, "Payjoin replay history is empty");
+        auto fallback_tx = DecodeFallbackTransaction(history->fallback_tx());
+        if (!fallback_tx) return util::Unexpected<PayjoinError>{std::move(fallback_tx).error()};
+
         const auto replayed_state = checked_replay->state();
-        return std::visit(
+        auto state = std::visit(
             util::Overloaded{
                 [](const ::payjoin::SendSession::kWithReplyKey& state) -> util::Expected<State, PayjoinError> {
                     if (!state.inner) return Failure<State>(PayjoinErrorCode::Internal, "Payjoin replay state is empty");
@@ -540,14 +706,18 @@ util::Expected<State, PayjoinError> ReplayState(const std::shared_ptr<SenderEven
                     if (!state.inner) return Failure<State>(PayjoinErrorCode::Internal, "Payjoin replay state is empty");
                     return State{PollingReadyState{NonNullFfiHandle<::payjoin::PollingForProposal>::FromChecked(state.inner)}};
                 },
-                [](const ::payjoin::SendSession::kSenderPendingFallback&) -> util::Expected<State, PayjoinError> {
-                    return Failure<State>(PayjoinErrorCode::InvalidState, "Payjoin replay state is not ready for a request");
+                [](const ::payjoin::SendSession::kSenderPendingFallback& state) -> util::Expected<State, PayjoinError> {
+                    if (!state.inner) return Failure<State>(PayjoinErrorCode::Internal, "Payjoin replay state is empty");
+                    return State{PendingFallbackState{NonNullFfiHandle<::payjoin::SenderPendingFallback>::FromChecked(state.inner)}};
                 },
-                [](const ::payjoin::SendSession::kClosed&) -> util::Expected<State, PayjoinError> {
-                    return Failure<State>(PayjoinErrorCode::InvalidState, "Payjoin replay state is not ready for a request");
+                [](const ::payjoin::SendSession::kClosed& state) -> util::Expected<State, PayjoinError> {
+                    if (!state.inner) return Failure<State>(PayjoinErrorCode::Internal, "Payjoin replay state is empty");
+                    return State{MakeClosedState(*state.inner)};
                 },
             },
             replayed_state.get_variant());
+        if (!state) return util::Unexpected<PayjoinError>{std::move(state).error()};
+        return ReplayedState{std::move(state).value(), std::move(fallback_tx).value()};
     } catch (::payjoin::SenderReplayError& error) {
         if (auto callback_error = invocation.GetError()) return util::Unexpected<PayjoinError>{std::move(*callback_error)};
         return util::Unexpected<PayjoinError>{MapReplayError(error)};
@@ -597,11 +767,23 @@ PayjoinError MapCreateRequestError(::payjoin::CreateRequestError& error)
     return MakeError(PayjoinErrorCode::Internal, "Payjoin request could not be created");
 }
 
+util::Expected<void, PayjoinError> CheckRelayScheme(std::string_view relay)
+{
+    const auto prefix = ToLower(relay.substr(0, 8));
+    if (!prefix.starts_with("http://") && !prefix.starts_with("https://")) {
+        return Failure<void>(
+            PayjoinErrorCode::InvalidUri,
+            "Payjoin relay URL must use HTTP or HTTPS");
+    }
+    return {};
+}
+
 util::Expected<PreparedRequestData, PayjoinError> PrepareInitialRequest(
     const NonNullFfiHandle<::payjoin::WithReplyKey>& sender,
     const std::string& relay)
 {
     try {
+        if (auto valid = CheckRelayScheme(relay); !valid) return util::Unexpected<PayjoinError>{valid.error()};
         return CheckRequestContext(sender->create_v2_post_request(relay));
     } catch (::payjoin::CreateRequestError& error) {
         return util::Unexpected<PayjoinError>{MapCreateRequestError(error)};
@@ -617,6 +799,7 @@ util::Expected<PreparedRequestData, PayjoinError> PreparePollingRequest(
     const std::string& relay)
 {
     try {
+        if (auto valid = CheckRelayScheme(relay); !valid) return util::Unexpected<PayjoinError>{valid.error()};
         return CheckRequestContext(sender->create_poll_request(relay));
     } catch (::payjoin::CreateRequestError& error) {
         return util::Unexpected<PayjoinError>{MapCreateRequestError(error)};
@@ -638,20 +821,35 @@ struct InitialResponseInput {
     std::vector<std::uint8_t> response;
 };
 
-struct InitialResponseOutcome {
+struct PollingResponseInput {
+    NonNullFfiHandle<::payjoin::PollingForProposal> sender;
+    PendingOhttpContext context;
+    std::vector<std::uint8_t> response;
+};
+
+struct ResponseOutcome {
     State next_state;
     util::Expected<SenderResponse, PayjoinError> response;
 };
 
-InitialResponseOutcome UnusableResponse(PayjoinError error)
+ResponseOutcome UnusableResponse(PayjoinError error)
 {
-    return InitialResponseOutcome{
-        .next_state = State{UnusableState{}},
+    auto response_error = error;
+    return ResponseOutcome{
+        .next_state = State{UnusableState{std::move(error)}},
+        .response = util::Unexpected<PayjoinError>{std::move(response_error)},
+    };
+}
+
+ResponseOutcome ClosedResponse(PayjoinError error)
+{
+    return ResponseOutcome{
+        .next_state = State{ClosedState{SenderAborted{error}}},
         .response = util::Unexpected<PayjoinError>{std::move(error)},
     };
 }
 
-InitialResponseOutcome ProcessInitialResponse(
+ResponseOutcome ProcessInitialResponse(
     InitialResponseInput input,
     const std::shared_ptr<SenderEventLogAdapter>& adapter)
 {
@@ -669,18 +867,19 @@ InitialResponseOutcome ProcessInitialResponse(
         if (!polling) {
             return UnusableResponse(MakeError(PayjoinErrorCode::Internal, "Payjoin polling state is empty"));
         }
-        return InitialResponseOutcome{
+        return ResponseOutcome{
             .next_state = State{PollingReadyState{NonNullFfiHandle<::payjoin::PollingForProposal>::FromChecked(std::move(polling))}},
-            .response = SenderResponse{},
+            .response = SenderResponse{SenderPosted{}},
         };
     } catch (const ::payjoin::sender_persisted_error::Transient&) {
         if (auto error = invocation.GetError()) return UnusableResponse(std::move(*error));
-        return InitialResponseOutcome{
+        return ResponseOutcome{
             .next_state = State{InitialReadyState{std::move(input.sender)}},
             .response = Failure<SenderResponse>(PayjoinErrorCode::Transient, "Payjoin response was transiently rejected"),
         };
-    } catch (const ::payjoin::sender_persisted_error::Fatal&) {
-        return UnusableResponse(PersistenceError(invocation, PayjoinErrorCode::Fatal, "Payjoin response was fatally rejected"));
+    } catch (const ::payjoin::sender_persisted_error::Fatal& fatal) {
+        if (auto callback_error = invocation.GetError()) return UnusableResponse(std::move(*callback_error));
+        return ClosedResponse(MakeFatalDiagnostic(fatal));
     } catch (const ::payjoin::sender_persisted_error::Storage&) {
         return UnusableResponse(PersistenceError(invocation, PayjoinErrorCode::Storage, "Payjoin response transition could not be persisted"));
     } catch (const std::bad_alloc&) {
@@ -690,20 +889,85 @@ InitialResponseOutcome ProcessInitialResponse(
     }
 }
 
+ResponseOutcome ProcessPollingResponse(
+    PollingResponseInput input,
+    const std::shared_ptr<SenderEventLogAdapter>& adapter)
+{
+    auto invocation = adapter->BeginInvocation();
+    try {
+        auto context = std::move(input.context).Consume();
+        auto transition = input.sender->process_response(input.response, context);
+        if (!transition) {
+            return UnusableResponse(MakeError(PayjoinErrorCode::Internal, "Payjoin polling response transition is empty"));
+        }
+        auto checked_transition = NonNullFfiHandle<::payjoin::PollingForProposalTransition>::FromChecked(std::move(transition));
+
+        auto outcome = checked_transition->save(adapter);
+        if (auto error = invocation.GetError()) return UnusableResponse(std::move(*error));
+
+        return std::visit(
+            util::Overloaded{
+                [](const ::payjoin::PollingForProposalTransitionOutcome::kStasis& outcome) -> ResponseOutcome {
+                    if (!outcome.inner) {
+                        return UnusableResponse(MakeError(PayjoinErrorCode::Internal, "Payjoin polling state is empty"));
+                    }
+                    return ResponseOutcome{
+                        .next_state = State{PollingReadyState{NonNullFfiHandle<::payjoin::PollingForProposal>::FromChecked(outcome.inner)}},
+                        .response = SenderResponse{SenderNoProposalYet{}},
+                    };
+                },
+                [](const ::payjoin::PollingForProposalTransitionOutcome::kProgress& outcome) -> ResponseOutcome {
+                    auto proposal = DecodeProposalBase64(outcome.psbt_base64);
+                    if (!proposal) {
+                        auto error = std::move(proposal).error();
+                        return ResponseOutcome{
+                            .next_state = State{ClosedState{SenderSuccessWithoutProposal{error}}},
+                            .response = util::Unexpected<PayjoinError>{std::move(error)},
+                        };
+                    }
+                    auto proposal_value = std::move(proposal).value();
+                    auto response_proposal = proposal_value;
+                    return ResponseOutcome{
+                        .next_state = State{ClosedState{SenderProposal{std::move(proposal_value)}}},
+                        .response = SenderResponse{SenderProposal{std::move(response_proposal)}},
+                    };
+                },
+            },
+            outcome.get_variant());
+    } catch (const ::payjoin::sender_persisted_error::Transient&) {
+        if (auto error = invocation.GetError()) return UnusableResponse(std::move(*error));
+        return ResponseOutcome{
+            .next_state = State{PollingReadyState{std::move(input.sender)}},
+            .response = Failure<SenderResponse>(PayjoinErrorCode::Transient, "Payjoin polling response was transiently rejected"),
+        };
+    } catch (const ::payjoin::sender_persisted_error::Fatal& fatal) {
+        if (auto callback_error = invocation.GetError()) return UnusableResponse(std::move(*callback_error));
+        return ClosedResponse(MakeFatalDiagnostic(fatal));
+    } catch (const ::payjoin::sender_persisted_error::Storage&) {
+        return UnusableResponse(PersistenceError(invocation, PayjoinErrorCode::Storage, "Payjoin polling response transition could not be persisted"));
+    } catch (const std::bad_alloc&) {
+        throw;
+    } catch (const std::exception&) {
+        return UnusableResponse(PersistenceError(invocation, PayjoinErrorCode::Internal, "Payjoin polling response processing failed"));
+    }
+}
+
 } // namespace
 
 class SenderSession::Impl
 {
 public:
-    Impl(State state, std::shared_ptr<SenderEventLogAdapter> event_log_adapter, SenderEventLogLease event_log_lease)
-        : m_event_log_lease(std::move(event_log_lease)), m_state(std::move(state)), m_event_log_adapter(std::move(event_log_adapter))
+    Impl(State state, CTransactionRef fallback_tx, std::shared_ptr<SenderEventLogAdapter> event_log_adapter)
+        : m_event_log_adapter(std::move(event_log_adapter)), m_state(std::move(state)), m_fallback_tx(std::move(fallback_tx))
     {
         Assume(m_event_log_adapter != nullptr);
+        Assume(m_fallback_tx != nullptr);
     }
 
-    SenderEventLogLease m_event_log_lease;
-    State m_state;
+    // Declared first so the journal claim is released last.
     std::shared_ptr<SenderEventLogAdapter> m_event_log_adapter;
+    State m_state;
+    CTransactionRef m_fallback_tx;
 };
 
 util::Expected<SenderSession, PayjoinError> SenderSession::Create(
@@ -719,11 +983,35 @@ util::Expected<SenderSession, PayjoinError> SenderSession::Create(
         return Failure<SenderSession>(PayjoinErrorCode::InvalidState, "Payjoin event log is already in use");
     }
 
-    auto adapter = std::make_shared<SenderEventLogAdapter>(std::move(event_log));
+    auto adapter = std::make_shared<SenderEventLogAdapter>(std::move(*event_log_lease));
     auto empty_log = RequireEmptyEventLog(adapter);
     if (!empty_log) return util::Unexpected<PayjoinError>{std::move(empty_log).error()};
 
-    auto psbt_base64 = SerializePsbtForFfi(psbt);
+    // Avoid copying PSBTv0 inputs.
+    const PartiallySignedTransaction* psbt_for_ffi{&psbt};
+    std::optional<PartiallySignedTransaction> normalized_psbt;
+    if (psbt.GetVersion() != 0) {
+        auto normalized = NormalizeToPsbtV0(psbt);
+        if (!normalized) return util::Unexpected<PayjoinError>{std::move(normalized).error()};
+        normalized_psbt.emplace(std::move(normalized).value());
+        psbt_for_ffi = &*normalized_psbt;
+    }
+    for (std::size_t index = 0; index < psbt_for_ffi->inputs.size(); ++index) {
+        if (!PSBTInputSigned(psbt_for_ffi->inputs[index])) {
+            return Failure<SenderSession>(
+                PayjoinErrorCode::InvalidSenderInput,
+                "Payjoin sender PSBT input " + util::ToString(index) + " is not finalized");
+        }
+    }
+
+    auto fallback_psbt = *psbt_for_ffi;
+    CMutableTransaction fallback_transaction;
+    if (!FinalizeAndExtractPSBT(fallback_psbt, fallback_transaction)) {
+        return Failure<SenderSession>(PayjoinErrorCode::InvalidSenderInput, "Payjoin sender fallback transaction could not be extracted from the supplied PSBT");
+    }
+    auto fallback_tx = MakeTransactionRef(std::move(fallback_transaction));
+
+    auto psbt_base64 = SerializePsbtV0ForFfi(*psbt_for_ffi);
     if (!psbt_base64) return util::Unexpected<PayjoinError>{std::move(psbt_base64).error()};
 
     const auto fee_rate = GetMinFeeRate(min_fee_rate);
@@ -742,7 +1030,7 @@ util::Expected<SenderSession, PayjoinError> SenderSession::Create(
     auto initial_state = PersistInitialState(*transition, adapter);
     if (!initial_state) return util::Unexpected<PayjoinError>{std::move(initial_state).error()};
 
-    return SenderSession{std::make_unique<Impl>(State{std::move(initial_state).value()}, std::move(adapter), std::move(*event_log_lease))};
+    return SenderSession{std::make_unique<Impl>(State{std::move(initial_state).value()}, std::move(fallback_tx), std::move(adapter))};
 }
 
 util::Expected<SenderSession, PayjoinError> SenderSession::Replay(std::shared_ptr<SenderEventLog> event_log)
@@ -754,11 +1042,16 @@ util::Expected<SenderSession, PayjoinError> SenderSession::Replay(std::shared_pt
         return Failure<SenderSession>(PayjoinErrorCode::InvalidState, "Payjoin event log is already in use");
     }
 
-    auto adapter = std::make_shared<SenderEventLogAdapter>(std::move(event_log));
+    auto adapter = std::make_shared<SenderEventLogAdapter>(std::move(*event_log_lease));
     auto replayed_state = ReplayState(adapter);
     if (!replayed_state) return util::Unexpected<PayjoinError>{std::move(replayed_state).error()};
 
-    return SenderSession{std::make_unique<Impl>(std::move(replayed_state).value(), std::move(adapter), std::move(*event_log_lease))};
+    auto replayed = std::move(replayed_state).value();
+    if (std::holds_alternative<ClosedState>(replayed.state)) {
+        auto closed = CloseReplayedEventLog(adapter);
+        if (!closed) return util::Unexpected<PayjoinError>{std::move(closed).error()};
+    }
+    return SenderSession{std::make_unique<Impl>(std::move(replayed.state), std::move(replayed.fallback_tx), std::move(adapter))};
 }
 
 util::Expected<SenderRequest, PayjoinError> SenderSession::PrepareRequest(std::string_view relay)
@@ -796,6 +1089,12 @@ util::Expected<SenderRequest, PayjoinError> SenderSession::PrepareRequest(std::s
             [](const PollingPendingState&) -> util::Expected<PreparedRequestTransition, PayjoinError> {
                 return Failure<PreparedRequestTransition>(PayjoinErrorCode::InvalidState, "Payjoin sender session is not ready for a request");
             },
+            [](const PendingFallbackState&) -> util::Expected<PreparedRequestTransition, PayjoinError> {
+                return Failure<PreparedRequestTransition>(PayjoinErrorCode::InvalidState, "Payjoin sender session is not ready for a request");
+            },
+            [](const ClosedState&) -> util::Expected<PreparedRequestTransition, PayjoinError> {
+                return Failure<PreparedRequestTransition>(PayjoinErrorCode::InvalidState, "Payjoin sender session is not ready for a request");
+            },
             [](const UnusableState&) -> util::Expected<PreparedRequestTransition, PayjoinError> {
                 return Failure<PreparedRequestTransition>(PayjoinErrorCode::InvalidState, "Payjoin sender session is not ready for a request");
             },
@@ -814,41 +1113,72 @@ util::Expected<SenderResponse, PayjoinError> SenderSession::ProcessResponse(std:
         return Failure<SenderResponse>(PayjoinErrorCode::InvalidState, "Payjoin sender session has no response pending");
     }
 
+    using PendingState = std::variant<InitialPendingState*, PollingPendingState*>;
     auto pending = std::visit(
         util::Overloaded{
-            [](InitialReadyState&) -> util::Expected<InitialPendingState*, PayjoinError> {
-                return Failure<InitialPendingState*>(PayjoinErrorCode::InvalidState, "Payjoin sender session has no response pending");
+            [](InitialReadyState&) -> util::Expected<PendingState, PayjoinError> {
+                return Failure<PendingState>(PayjoinErrorCode::InvalidState, "Payjoin sender session has no response pending");
             },
-            [](InitialPendingState& state) -> util::Expected<InitialPendingState*, PayjoinError> { return &state; },
-            [](PollingReadyState&) -> util::Expected<InitialPendingState*, PayjoinError> {
-                return Failure<InitialPendingState*>(PayjoinErrorCode::InvalidState, "Payjoin sender session has no response pending");
+            [](InitialPendingState& state) -> util::Expected<PendingState, PayjoinError> { return PendingState{&state}; },
+            [](PollingReadyState&) -> util::Expected<PendingState, PayjoinError> {
+                return Failure<PendingState>(PayjoinErrorCode::InvalidState, "Payjoin sender session has no response pending");
             },
-            [](PollingPendingState&) -> util::Expected<InitialPendingState*, PayjoinError> {
-                return Failure<InitialPendingState*>(PayjoinErrorCode::InvalidState, "Payjoin sender session is not waiting for an initial response");
+            [](PollingPendingState& state) -> util::Expected<PendingState, PayjoinError> { return PendingState{&state}; },
+            [](const PendingFallbackState&) -> util::Expected<PendingState, PayjoinError> {
+                return Failure<PendingState>(PayjoinErrorCode::InvalidState, "Payjoin sender session has no response pending");
             },
-            [](UnusableState&) -> util::Expected<InitialPendingState*, PayjoinError> {
-                return Failure<InitialPendingState*>(PayjoinErrorCode::InvalidState, "Payjoin sender session has no response pending");
+            [](const ClosedState&) -> util::Expected<PendingState, PayjoinError> {
+                return Failure<PendingState>(PayjoinErrorCode::InvalidState, "Payjoin sender session has no response pending");
+            },
+            [](UnusableState&) -> util::Expected<PendingState, PayjoinError> {
+                return Failure<PendingState>(PayjoinErrorCode::InvalidState, "Payjoin sender session has no response pending");
             },
         },
         m_impl->m_state);
     if (!pending) return util::Unexpected<PayjoinError>{std::move(pending).error()};
 
-    InitialPendingState& state = **pending;
     if (response.size() > MAX_PAYJOIN_RESPONSE_BYTES) {
-        auto sender = NonNullFfiHandle<::payjoin::WithReplyKey>::FromChecked(state.sender.GetShared());
-        m_impl->m_state = InitialReadyState{std::move(sender)};
+        std::visit(
+            util::Overloaded{
+                [this](InitialPendingState* state) {
+                    m_impl->m_state = State{InitialReadyState{NonNullFfiHandle<::payjoin::WithReplyKey>::FromChecked(state->sender.GetShared())}};
+                },
+                [this](PollingPendingState* state) {
+                    m_impl->m_state = State{PollingReadyState{NonNullFfiHandle<::payjoin::PollingForProposal>::FromChecked(state->sender.GetShared())}};
+                },
+            },
+            *pending);
         return Failure<SenderResponse>(PayjoinErrorCode::Transient, "Payjoin response exceeds the 1 MiB safety limit");
     }
 
     std::vector<std::uint8_t> response_bytes{response.begin(), response.end()};
-    InitialResponseInput input{
-        .sender = NonNullFfiHandle<::payjoin::WithReplyKey>::FromChecked(state.sender.GetShared()),
-        .context = std::move(state.context),
-        .response = std::move(response_bytes),
-    };
+    using ResponseInput = std::variant<InitialResponseInput, PollingResponseInput>;
+    auto input = std::visit(
+        util::Overloaded{
+            [&response_bytes](InitialPendingState* state) -> ResponseInput {
+                return InitialResponseInput{
+                    .sender = NonNullFfiHandle<::payjoin::WithReplyKey>::FromChecked(state->sender.GetShared()),
+                    .context = std::move(state->context),
+                    .response = std::move(response_bytes),
+                };
+            },
+            [&response_bytes](PollingPendingState* state) -> ResponseInput {
+                return PollingResponseInput{
+                    .sender = NonNullFfiHandle<::payjoin::PollingForProposal>::FromChecked(state->sender.GetShared()),
+                    .context = std::move(state->context),
+                    .response = std::move(response_bytes),
+                };
+            },
+        },
+        *pending);
 
-    m_impl->m_state = UnusableState{};
-    auto outcome = ProcessInitialResponse(std::move(input), m_impl->m_event_log_adapter);
+    m_impl->m_state = State{UnusableState{std::nullopt}};
+    auto outcome = std::visit(
+        util::Overloaded{
+            [this](InitialResponseInput input) { return ProcessInitialResponse(std::move(input), m_impl->m_event_log_adapter); },
+            [this](PollingResponseInput input) { return ProcessPollingResponse(std::move(input), m_impl->m_event_log_adapter); },
+        },
+        std::move(input));
     m_impl->m_state = std::move(outcome.next_state);
     return std::move(outcome.response);
 }
@@ -873,6 +1203,12 @@ util::Expected<void, PayjoinError> SenderSession::DiscardPendingRequest()
             [](const PollingPendingState& state) -> util::Expected<State, PayjoinError> {
                 return State{PollingReadyState{NonNullFfiHandle<::payjoin::PollingForProposal>::FromChecked(state.sender.GetShared())}};
             },
+            [](const PendingFallbackState&) -> util::Expected<State, PayjoinError> {
+                return Failure<State>(PayjoinErrorCode::InvalidState, "Payjoin sender session has no pending request");
+            },
+            [](const ClosedState&) -> util::Expected<State, PayjoinError> {
+                return Failure<State>(PayjoinErrorCode::InvalidState, "Payjoin sender session has no pending request");
+            },
             [](const UnusableState&) -> util::Expected<State, PayjoinError> {
                 return Failure<State>(PayjoinErrorCode::InvalidState, "Payjoin sender session has no pending request");
             },
@@ -882,6 +1218,161 @@ util::Expected<void, PayjoinError> SenderSession::DiscardPendingRequest()
 
     m_impl->m_state = std::move(next_state).value();
     return {};
+}
+
+SenderPhase SenderSession::Phase() const
+{
+    if (!m_impl) return SenderPhase::Unusable;
+    return std::visit(
+        util::Overloaded{
+            [](const InitialReadyState&) { return SenderPhase::Initial; },
+            [](const InitialPendingState&) { return SenderPhase::Initial; },
+            [](const PollingReadyState&) { return SenderPhase::Polling; },
+            [](const PollingPendingState&) { return SenderPhase::Polling; },
+            [](const PendingFallbackState&) { return SenderPhase::PendingFallback; },
+            [](const ClosedState&) { return SenderPhase::Closed; },
+            [](const UnusableState&) { return SenderPhase::Unusable; },
+        },
+        m_impl->m_state);
+}
+
+bool SenderSession::HasPendingRequest() const
+{
+    if (!m_impl) return false;
+    return std::holds_alternative<InitialPendingState>(m_impl->m_state) ||
+           std::holds_alternative<PollingPendingState>(m_impl->m_state);
+}
+
+std::optional<SenderOutcome> SenderSession::Outcome() const
+{
+    if (!m_impl) return std::nullopt;
+    if (const auto* state = std::get_if<ClosedState>(&m_impl->m_state)) return state->outcome;
+    return std::nullopt;
+}
+
+std::optional<PayjoinError> SenderSession::LastError() const
+{
+    if (!m_impl) return std::nullopt;
+    if (const auto* state = std::get_if<ClosedState>(&m_impl->m_state)) {
+        return std::visit(
+            util::Overloaded{
+                [](const SenderProposal&) -> std::optional<PayjoinError> { return std::nullopt; },
+                [](const SenderSuccessWithoutProposal& outcome) -> std::optional<PayjoinError> { return outcome.error; },
+                [](const SenderAborted& outcome) -> std::optional<PayjoinError> { return outcome.diagnostic; },
+                [](const SenderUnknownOutcome& outcome) -> std::optional<PayjoinError> { return outcome.error; },
+            },
+            state->outcome);
+    }
+    if (const auto* state = std::get_if<UnusableState>(&m_impl->m_state)) return state->error;
+    return std::nullopt;
+}
+
+util::Expected<CTransactionRef, PayjoinError> SenderSession::FallbackTransaction() const
+{
+    if (!m_impl) {
+        return Failure<CTransactionRef>(PayjoinErrorCode::InvalidState, "Payjoin sender session was moved from");
+    }
+    if (!m_impl->m_fallback_tx) {
+        return Failure<CTransactionRef>(PayjoinErrorCode::Internal, "Payjoin fallback transaction is unavailable");
+    }
+    return m_impl->m_fallback_tx;
+}
+
+util::Expected<void, PayjoinError> SenderSession::Cancel()
+{
+    if (!m_impl) return Failure<void>(PayjoinErrorCode::InvalidState, "Payjoin sender session cannot be canceled");
+
+    using CancelSender = std::variant<
+        NonNullFfiHandle<::payjoin::WithReplyKey>,
+        NonNullFfiHandle<::payjoin::PollingForProposal>>;
+    auto sender = std::visit(
+        util::Overloaded{
+            [](const InitialReadyState& state) -> util::Expected<CancelSender, PayjoinError> {
+                return CancelSender{NonNullFfiHandle<::payjoin::WithReplyKey>::FromChecked(state.sender.GetShared())};
+            },
+            [](const PollingReadyState& state) -> util::Expected<CancelSender, PayjoinError> {
+                return CancelSender{NonNullFfiHandle<::payjoin::PollingForProposal>::FromChecked(state.sender.GetShared())};
+            },
+            [](const InitialPendingState&) -> util::Expected<CancelSender, PayjoinError> {
+                return Failure<CancelSender>(PayjoinErrorCode::InvalidState, "DiscardPendingRequest() is required before canceling a pending request");
+            },
+            [](const PollingPendingState&) -> util::Expected<CancelSender, PayjoinError> {
+                return Failure<CancelSender>(PayjoinErrorCode::InvalidState, "DiscardPendingRequest() is required before canceling a pending request");
+            },
+            [](const PendingFallbackState&) -> util::Expected<CancelSender, PayjoinError> {
+                return Failure<CancelSender>(PayjoinErrorCode::InvalidState, "Payjoin sender session is already canceled");
+            },
+            [](const ClosedState&) -> util::Expected<CancelSender, PayjoinError> {
+                return Failure<CancelSender>(PayjoinErrorCode::InvalidState, "Payjoin sender session is already closed");
+            },
+            [](const UnusableState&) -> util::Expected<CancelSender, PayjoinError> {
+                return Failure<CancelSender>(PayjoinErrorCode::InvalidState, "Payjoin sender session is unusable");
+            },
+        },
+        m_impl->m_state);
+    if (!sender) return util::Unexpected<PayjoinError>{std::move(sender).error()};
+
+    m_impl->m_state = State{UnusableState{std::nullopt}};
+    auto invocation = m_impl->m_event_log_adapter->BeginInvocation();
+    try {
+        auto transition = std::visit(
+            util::Overloaded{
+                [](NonNullFfiHandle<::payjoin::WithReplyKey> sender) -> NonNullFfiHandle<::payjoin::SenderCancelTransition> {
+                    return NonNullFfiHandle<::payjoin::SenderCancelTransition>::FromChecked(sender->cancel());
+                },
+                [](NonNullFfiHandle<::payjoin::PollingForProposal> sender) -> NonNullFfiHandle<::payjoin::SenderCancelTransition> {
+                    return NonNullFfiHandle<::payjoin::SenderCancelTransition>::FromChecked(sender->cancel());
+                },
+            },
+            std::move(sender).value());
+
+        auto pending = transition->save(m_impl->m_event_log_adapter);
+        if (auto error = invocation.GetError()) {
+            return FailUnusable(m_impl->m_state, std::move(*error));
+        }
+        if (!pending) {
+            return FailUnusable(m_impl->m_state, MakeError(PayjoinErrorCode::Internal, "Payjoin pending fallback state is empty"));
+        }
+        m_impl->m_state = State{PendingFallbackState{NonNullFfiHandle<::payjoin::SenderPendingFallback>::FromChecked(std::move(pending))}};
+        return {};
+    } catch (const ::payjoin::sender_persisted_error::Storage&) {
+        return FailUnusable(m_impl->m_state, PersistenceError(invocation, PayjoinErrorCode::Storage, "Payjoin sender cancellation could not be persisted"));
+    } catch (const std::bad_alloc&) {
+        throw;
+    } catch (const std::exception&) {
+        return FailUnusable(m_impl->m_state, PersistenceError(invocation, PayjoinErrorCode::Internal, "Payjoin sender cancellation failed"));
+    }
+}
+
+util::Expected<void, PayjoinError> SenderSession::CloseFallback()
+{
+    if (!m_impl) return Failure<void>(PayjoinErrorCode::InvalidState, "Payjoin sender session cannot close fallback");
+
+    const auto* pending = std::get_if<PendingFallbackState>(&m_impl->m_state);
+    if (!pending) return Failure<void>(PayjoinErrorCode::InvalidState, "Payjoin sender session is not pending fallback");
+
+    auto sender = NonNullFfiHandle<::payjoin::SenderPendingFallback>::FromChecked(pending->sender.GetShared());
+    m_impl->m_state = State{UnusableState{std::nullopt}};
+    auto invocation = m_impl->m_event_log_adapter->BeginInvocation();
+    try {
+        auto transition = sender->close();
+        if (!transition) {
+            return FailUnusable(m_impl->m_state, MakeError(PayjoinErrorCode::Internal, "Payjoin fallback close transition is empty"));
+        }
+        auto checked_transition = NonNullFfiHandle<::payjoin::BroadcastedTransition>::FromChecked(std::move(transition));
+        checked_transition->save(m_impl->m_event_log_adapter);
+        if (auto error = invocation.GetError()) {
+            return FailUnusable(m_impl->m_state, std::move(*error));
+        }
+        m_impl->m_state = State{ClosedState{SenderAborted{std::nullopt}}};
+        return {};
+    } catch (const ::payjoin::sender_persisted_error::Storage&) {
+        return FailUnusable(m_impl->m_state, PersistenceError(invocation, PayjoinErrorCode::Storage, "Payjoin fallback close could not be persisted"));
+    } catch (const std::bad_alloc&) {
+        throw;
+    } catch (const std::exception&) {
+        return FailUnusable(m_impl->m_state, PersistenceError(invocation, PayjoinErrorCode::Internal, "Payjoin fallback close failed"));
+    }
 }
 
 SenderSession::SenderSession(std::unique_ptr<Impl> impl) : m_impl(std::move(impl)) {}
