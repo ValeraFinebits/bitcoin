@@ -11,6 +11,7 @@
 #include <util/check.h>
 #include <util/overloaded.h>
 #include <util/strencodings.h>
+#include <util/string.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -308,7 +309,7 @@ util::Expected<PartiallySignedTransaction, PayjoinError> DecodeProposalBase64(st
         return Failure<PartiallySignedTransaction>(
             PayjoinErrorCode::Internal,
             "Payjoin proposal PSBT could not be decoded (" +
-                std::to_string(base64.size()) +
+                util::ToString(base64.size()) +
                 " base64 chars); the Closed event in the session log holds the proposal");
     } catch (const std::bad_alloc&) {
         throw;
@@ -316,7 +317,7 @@ util::Expected<PartiallySignedTransaction, PayjoinError> DecodeProposalBase64(st
         return Failure<PartiallySignedTransaction>(
             PayjoinErrorCode::Internal,
             "Payjoin proposal PSBT decoding failed (" +
-                std::to_string(base64.size()) +
+                util::ToString(base64.size()) +
                 " base64 chars); the Closed event in the session log holds the proposal");
     }
 }
@@ -999,7 +1000,7 @@ util::Expected<SenderSession, PayjoinError> SenderSession::Create(
         if (!PSBTInputSigned(psbt_for_ffi->inputs[index])) {
             return Failure<SenderSession>(
                 PayjoinErrorCode::InvalidSenderInput,
-                "Payjoin sender PSBT input " + std::to_string(index) + " is not finalized");
+                "Payjoin sender PSBT input " + util::ToString(index) + " is not finalized");
         }
     }
 
