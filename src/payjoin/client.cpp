@@ -250,17 +250,13 @@ util::Expected<PartiallySignedTransaction, PayjoinError> NormalizePsbtV2ForFfi(c
     }
 
     for (std::size_t index = 0; index < psbt.inputs.size(); ++index) {
-        if (!normalized.inputs[index].Merge(psbt.inputs[index])) {
-            return Failure<PartiallySignedTransaction>(PayjoinErrorCode::Internal, "Payjoin PSBTv2 input records could not be normalized");
-        }
+        normalized.inputs[index].Merge(psbt.inputs[index]);
         normalized.inputs[index].sighash_type = psbt.inputs[index].sighash_type;
         normalized.inputs[index].time_locktime.reset();
         normalized.inputs[index].height_locktime.reset();
     }
     for (std::size_t index = 0; index < psbt.outputs.size(); ++index) {
-        if (!normalized.outputs[index].Merge(psbt.outputs[index])) {
-            return Failure<PartiallySignedTransaction>(PayjoinErrorCode::Internal, "Payjoin PSBTv2 output records could not be normalized");
-        }
+        normalized.outputs[index].Merge(psbt.outputs[index]);
     }
 
     const auto normalized_tx = normalized.GetUnsignedTx();
