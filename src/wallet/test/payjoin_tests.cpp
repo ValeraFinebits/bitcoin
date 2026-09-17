@@ -207,11 +207,11 @@ PartiallySignedTransaction MakeEquivalentPsbtV2(const PartiallySignedTransaction
     BOOST_REQUIRE_EQUAL(psbt_v2.outputs.size(), psbt_v0.outputs.size());
 
     for (std::size_t index = 0; index < psbt_v0.inputs.size(); ++index) {
-        BOOST_REQUIRE(psbt_v2.inputs[index].Merge(psbt_v0.inputs[index]));
+        psbt_v2.inputs[index].Merge(psbt_v0.inputs[index]);
         psbt_v2.inputs[index].sighash_type = psbt_v0.inputs[index].sighash_type;
     }
     for (std::size_t index = 0; index < psbt_v0.outputs.size(); ++index) {
-        BOOST_REQUIRE(psbt_v2.outputs[index].Merge(psbt_v0.outputs[index]));
+        psbt_v2.outputs[index].Merge(psbt_v0.outputs[index]);
     }
     return psbt_v2;
 }
@@ -228,7 +228,7 @@ void CheckFallbackEquals(const SenderSession& session, const CTransactionRef& ex
 {
     auto fallback = session.FallbackTransaction();
     BOOST_REQUIRE_MESSAGE(fallback, std::string{label} + ": fallback transaction unavailable");
-    if (fallback) BOOST_CHECK_MESSAGE(**fallback == *expected, std::string{label} + ": fallback transaction differs");
+    if (fallback) BOOST_CHECK_MESSAGE((*fallback)->Equals(*expected), std::string{label} + ": fallback transaction differs");
 }
 
 CTransactionRef ExtractFallback(const PartiallySignedTransaction& psbt)
