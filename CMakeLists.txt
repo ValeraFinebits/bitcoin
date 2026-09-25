@@ -642,6 +642,11 @@ endif()
 add_subdirectory(test)
 add_subdirectory(doc)
 
+if(ENABLE_PAYJOIN)
+  # FindCURL prefers curl's own config package, including static dependencies.
+  find_package(CURL 8.22 REQUIRED)
+endif()
+
 add_subdirectory(src)
 
 include(Maintenance)
