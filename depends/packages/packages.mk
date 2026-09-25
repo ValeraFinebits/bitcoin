@@ -26,5 +26,6 @@ multiprocess_native_packages = native_libmultiprocess native_capnp
 
 usdt_linux_packages=systemtap
 
-payjoin_linux_packages=payjoin_ffi
+# depends requires transitive packages to be registered as well.
+payjoin_linux_packages=payjoin_ffi curl openssl
 payjoin_linux_native_packages=native_payjoin_bindgen
