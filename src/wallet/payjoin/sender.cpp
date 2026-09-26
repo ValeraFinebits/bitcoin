@@ -575,7 +575,7 @@ struct SenderService::State : std::enable_shared_from_this<State> {
             payment.storage.disclosure_saved = true;
         }
 
-        Update(payment); 
+        Update(payment);
         const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(payment.deadline - m_now());
         if (remaining <= std::chrono::milliseconds::zero()) {
             Discard(payment);
