@@ -950,6 +950,20 @@ ResponseOutcome ProcessPollingResponse(
 
 } // namespace
 
+util::Expected<PayjoinUriInfo, PayjoinError> ParsePayjoinUri(std::string_view uri)
+{
+    auto parsed = ParsePjUri(uri);
+    if (!parsed) return util::Unexpected<PayjoinError>{parsed.error()};
+
+    try {
+        return PayjoinUriInfo{(*parsed)->address(), (*parsed)->amount_sats()};
+    } catch (const std::bad_alloc&) {
+        throw;
+    } catch (const std::exception&) {
+        return Failure<PayjoinUriInfo>(PayjoinErrorCode::Internal, "Payjoin URI fields could not be read");
+    }
+}
+
 class SenderSession::Impl
 {
 public:
@@ -1243,6 +1257,22 @@ std::optional<SenderOutcome> SenderSession::Outcome() const
 {
     if (!m_impl) return std::nullopt;
     if (const auto* state = std::get_if<ClosedState>(&m_impl->m_state)) return state->outcome;
+    return std::nullopt;
+}
+
+std::optional<SenderOutcomeKind> SenderSession::OutcomeKind() const
+{
+    if (!m_impl) return std::nullopt;
+    if (const auto* state = std::get_if<ClosedState>(&m_impl->m_state)) {
+        return std::visit(
+            util::Overloaded{
+                [](const SenderProposal&) { return SenderOutcomeKind::Proposal; },
+                [](const SenderSuccessWithoutProposal&) { return SenderOutcomeKind::SuccessWithoutProposal; },
+                [](const SenderAborted&) { return SenderOutcomeKind::Aborted; },
+                [](const SenderUnknownOutcome&) { return SenderOutcomeKind::Unknown; },
+            },
+            state->outcome);
+    }
     return std::nullopt;
 }
 
