@@ -162,12 +162,22 @@ struct HttpSenderTransport::Impl {
     explicit Impl(HttpTransportOptions options) : m_options{std::move(options)}
     {
         static const auto initialized = curl_global_init(CURL_GLOBAL_DEFAULT);
-        if (initialized != CURLE_OK || !(curl_version_info(CURLVERSION_NOW)->features & CURL_VERSION_ASYNCHDNS)) {
-            throw std::runtime_error{"asynchronous libcurl resolver required"};
+        if (initialized != CURLE_OK) {
+            throw std::runtime_error{strprintf("curl global initialization failed: %s", curl_easy_strerror(initialized))};
+        }
+        const auto* version = curl_version_info(CURLVERSION_NOW);
+        if (!(version->features & CURL_VERSION_ASYNCHDNS)) {
+            throw std::runtime_error{strprintf("Payjoin requires libcurl with asynchronous DNS support (loaded %s)", version->version)};
         }
 
-        if (!m_options.max_requests || !m_options.max_response_bytes || m_options.proxy.find('\0') != std::string::npos) {
-            throw std::invalid_argument{"invalid HTTP transport configuration"};
+        if (!m_options.max_requests || !m_options.max_response_bytes) {
+            throw std::invalid_argument{"invalid HTTP transport limits"};
+        }
+        if (m_options.proxy.find('\0') != std::string::npos) {
+            throw std::invalid_argument{"HTTP proxy contains an embedded NUL"};
+        }
+        if (m_options.ca_file.find('\0') != std::string::npos) {
+            throw std::invalid_argument{"CA file path contains an embedded NUL"};
         }
 
         m_multi.reset(curl_multi_init());

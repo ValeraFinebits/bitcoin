@@ -199,6 +199,11 @@ struct SenderService::State : std::enable_shared_from_this<State> {
         Clock::time_point deadline;
         uint64_t request{0};
         bool request_was_exposed{false};
+        struct RetiredRequest {
+            uint64_t id;
+            bool was_exposed;
+        };
+        std::optional<RetiredRequest> retired_request;
         uint64_t generation{0};
     };
 
@@ -603,9 +608,11 @@ struct SenderService::State : std::enable_shared_from_this<State> {
         auto completion = [weak = weak_from_this(), id = payment.id, request_id](TransportResult result) {
             if (auto locked_state = weak.lock()) {
                 locked_state->Queue(id, [request_id, result = std::move(result)](State& queued_state, Payment& queued_payment) {
-                    if (queued_payment.request != request_id) return;
-
-                    queued_state.Response(queued_payment, result);
+                    if (queued_payment.request == request_id) {
+                        queued_state.Response(queued_payment, result);
+                    } else if (queued_payment.retired_request && queued_payment.retired_request->id == request_id) {
+                        queued_state.RetiredResponse(queued_payment, result);
+                    }
                 });
             }
         };
@@ -623,6 +630,7 @@ struct SenderService::State : std::enable_shared_from_this<State> {
                 Fail(payment, PaymentIssue::Delivery, accepted == SubmitResult::Stopped ? "transport stopped" : "transport rejected invalid request");
             }
         } else {
+            payment.retired_request.reset();
             payment.transport_accepted = true;
             payment.phase = PaymentPhase::Negotiating;
             payment.diagnostic.clear();
@@ -674,6 +682,19 @@ struct SenderService::State : std::enable_shared_from_this<State> {
         } else {
             ScheduleDispatch(payment);
         }
+    }
+
+    void RetiredResponse(Payment& payment, const TransportResult& result) EXCLUSIVE_LOCKS_REQUIRED(!m_views_mutex)
+    {
+        const bool was_exposed = payment.retired_request->was_exposed;
+        payment.retired_request.reset();
+        if (result.delivery != Delivery::NotSent || payment.phase != PaymentPhase::Cancelled ||
+            was_exposed || payment.selected || payment.settlement || payment.storage.released) {
+            return;
+        }
+
+        if (!RestoreDisclosure(payment, was_exposed) || !AbandonUnexposed(payment)) return;
+        Update(payment);
     }
 
     void Sign(Payment& payment, PartiallySignedTransaction proposal) EXCLUSIVE_LOCKS_REQUIRED(!m_views_mutex)
@@ -857,7 +878,10 @@ struct SenderService::State : std::enable_shared_from_this<State> {
     void RetireRequest(Payment& payment)
     {
         ++payment.generation;
-        if (payment.request) m_transport->Cancel(std::exchange(payment.request, 0));
+        if (payment.request) {
+            payment.retired_request = Payment::RetiredRequest{std::exchange(payment.request, 0), payment.request_was_exposed};
+            m_transport->Cancel(payment.retired_request->id);
+        }
         payment.request_was_exposed = false;
         Discard(payment);
     }
