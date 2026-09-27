@@ -10,6 +10,7 @@
 #include <util/expected.h>
 
 #include <atomic>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <span>
@@ -41,6 +42,13 @@ struct PayjoinError {
     PayjoinErrorCode code;
     std::string message;
 };
+
+struct PayjoinUriInfo {
+    std::string address;
+    std::optional<uint64_t> amount_sats;
+};
+
+util::Expected<PayjoinUriInfo, PayjoinError> ParsePayjoinUri(std::string_view uri);
 
 struct SenderRequest {
     std::string url;
@@ -84,6 +92,13 @@ struct SenderUnknownOutcome {
  * establish whether the fallback transaction was broadcast. */
 using SenderOutcome = std::variant<SenderProposal, SenderSuccessWithoutProposal, SenderAborted, SenderUnknownOutcome>;
 
+enum class SenderOutcomeKind {
+    Proposal,
+    SuccessWithoutProposal,
+    Aborted,
+    Unknown,
+};
+
 /**
  * Synchronous persistence backend for a sender session.
  *
@@ -115,8 +130,8 @@ private:
  * Methods and event-log callbacks must not run concurrently. A pending OHTTP
  * context is one-shot: process its matching response or discard it explicitly.
  * After a move, instance methods returning Expected return InvalidState,
- * Phase() returns Unusable, HasPendingRequest() returns false, and Outcome()
- * and LastError() return nullopt.
+ * Phase() returns Unusable, HasPendingRequest() returns false, and Outcome(),
+ * OutcomeKind() and LastError() return nullopt.
  */
 class SenderSession
 {
@@ -183,6 +198,10 @@ public:
     bool HasPendingRequest() const;
     /** Return the terminal outcome, if the session is Closed. */
     std::optional<SenderOutcome> Outcome() const;
+
+    /** Return the terminal outcome kind without copying or decoding the proposal. */
+    std::optional<SenderOutcomeKind> OutcomeKind() const;
+
     /**
      * Return the current object's diagnostic, not a persisted error history.
      * Replay() does not restore abort diagnostics but may rediscover decode errors.
@@ -192,8 +211,12 @@ public:
     /**
      * Return the original signed transaction in every phase, including Unusable;
      * moved-from objects return InvalidState. Reconcile wallet records before
-     * broadcast or handoff. After success with a proposal, use it for reconciliation
-     * only: broadcasting it conflicts with the Payjoin transaction's inputs.
+     * broadcast or handoff. Access alone does not authorize publication. After a
+     * known successful outcome, an explicit wallet fallback may still select the
+     * original if no transaction has been selected and ownership, storage and
+     * current spends permit it. Once a proposal is selected, it conflicts with the
+     * original; use the original for reconciliation only. Never rewrite a
+     * successful journal as aborted to publish the original.
      */
     [[nodiscard]] util::Expected<CTransactionRef, PayjoinError> FallbackTransaction() const;
 
