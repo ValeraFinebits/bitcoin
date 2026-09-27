@@ -100,9 +100,9 @@ std::vector<unsigned char> TxBytes(const CTransactionRef& tx)
 {
     if (!tx) return {};
 
-    DataStream stream;
-    stream << TX_WITH_WITNESS(tx);
-    return {UCharCast(stream.data()), UCharCast(stream.data()) + stream.size()};
+    std::vector<unsigned char> bytes;
+    VectorWriter{bytes, 0, TX_WITH_WITNESS(tx)};
+    return bytes;
 }
 
 struct Record {
