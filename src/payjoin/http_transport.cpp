@@ -334,12 +334,13 @@ struct HttpSenderTransport::Impl {
                                        code == CURLE_COULDNT_RESOLVE_HOST || code == CURLE_COULDNT_RESOLVE_PROXY ||
                                        code == CURLE_RECV_ERROR || code == CURLE_SEND_ERROR || code == CURLE_GOT_NOTHING || code == CURLE_PARTIAL_FILE ||
                                        (code == CURLE_OK && (status == 429 || status >= 500));
-
-                const bool invalid_url = code == CURLE_URL_MALFORMAT || code == CURLE_UNSUPPORTED_PROTOCOL;
+                const bool not_sent = code == CURLE_URL_MALFORMAT || code == CURLE_UNSUPPORTED_PROTOCOL ||
+                                      code == CURLE_COULDNT_RESOLVE_HOST || code == CURLE_COULDNT_RESOLVE_PROXY ||
+                                      code == CURLE_COULDNT_CONNECT;
                 Delivery delivery{Delivery::Uncertain};
                 if (success) {
                     delivery = Delivery::Response;
-                } else if (invalid_url) {
+                } else if (not_sent) {
                     delivery = Delivery::NotSent;
                 }
 
