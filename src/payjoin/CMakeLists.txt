@@ -6,11 +6,13 @@ find_package(PayjoinFFI CONFIG REQUIRED)
 
 add_library(bitcoin_payjoin_ffi STATIC
   client.cpp
+  http_transport.cpp
 )
 target_link_libraries(bitcoin_payjoin_ffi
   PRIVATE
     core_interface
     Payjoin::cpp
+    CURL::libcurl
 )
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
