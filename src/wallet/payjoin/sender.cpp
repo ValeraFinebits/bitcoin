@@ -685,18 +685,25 @@ struct SenderService::State : std::enable_shared_from_this<State> {
             }
 
             const auto& input = proposal.inputs[i];
-            const CTxOut* utxo = !input.witness_utxo.IsNull() ? &input.witness_utxo : nullptr;
-            if (!utxo && input.non_witness_utxo && out.n < input.non_witness_utxo->vout.size()) utxo = &input.non_witness_utxo->vout[out.n];
-            if (!utxo || !MoneyRange(utxo->nValue) || total > MAX_MONEY - utxo->nValue) {
+            CTxOut utxo;
+            if (!input.GetUTXO(utxo)) {
+                Fail(payment, PaymentIssue::Signing, "invalid proposal UTXO");
+                return;
+            }
+            if (input.non_witness_utxo && !input.witness_utxo.IsNull() && input.witness_utxo != utxo) {
+                Fail(payment, PaymentIssue::Signing, "inconsistent proposal UTXO");
+                return;
+            }
+            if (!MoneyRange(utxo.nValue) || total > MAX_MONEY - utxo.nValue) {
                 Fail(payment, PaymentIssue::Signing, "invalid proposal input value");
                 return;
             }
-            if (m_wallet.IsMine(*utxo) && !allowed.contains(out)) {
+            if (m_wallet.IsMine(utxo) && !allowed.contains(out)) {
                 Fail(payment, PaymentIssue::Signing, "unexpected wallet script");
                 return;
             }
 
-            total += utxo->nValue;
+            total += utxo.nValue;
             allowed.erase(out);
         }
 
@@ -721,7 +728,7 @@ struct SenderService::State : std::enable_shared_from_this<State> {
         AssertLockHeld(m_wallet.cs_wallet);
         const auto known = m_wallet.mapWallet.find(tx->GetHash());
         const bool already_known = known != m_wallet.mapWallet.end();
-        if (already_known && TxBytes(known->second.GetTx()) != TxBytes(tx)) {
+        if (already_known && !known->second.GetTx()->Equals(*tx)) {
             Fail(payment, PaymentIssue::Publication, "wallet witness identity differs");
             return;
         }
@@ -779,7 +786,7 @@ struct SenderService::State : std::enable_shared_from_this<State> {
             Fail(payment, PaymentIssue::Publication, "original transaction is not in the wallet");
             return false;
         }
-        if (TxBytes(known->GetTx()) != TxBytes(payment.original)) {
+        if (!known->GetTx()->Equals(*payment.original)) {
             Fail(payment, PaymentIssue::Publication, "wallet witness identity differs");
             return false;
         }
@@ -1008,7 +1015,7 @@ struct SenderService::State : std::enable_shared_from_this<State> {
         if (!payment.selected || !payment.storage.selection_saved || !payment.wallet_recorded) return Refuse(payment, CommandRefusal::InvalidState);
 
         auto known = m_wallet.mapWallet.find(payment.selected->GetHash());
-        if (known == m_wallet.mapWallet.end() || TxBytes(known->second.GetTx()) != TxBytes(payment.selected)) {
+        if (known == m_wallet.mapWallet.end() || !known->second.GetTx()->Equals(*payment.selected)) {
             Fail(payment, PaymentIssue::Publication, "selected transaction requires reconciliation");
             return;
         }
