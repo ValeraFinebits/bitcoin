@@ -16,6 +16,7 @@
 #include <primitives/transaction.h>
 #include <psbt.h>
 #include <random.h>
+#include <scheduler.h>
 #include <serialize.h>
 #include <span.h>
 #include <streams.h>
@@ -201,10 +202,11 @@ struct SenderService::State : std::enable_shared_from_this<State> {
     };
 
     CWallet& m_wallet;
-    std::shared_ptr<util::TaskRunnerInterface> m_executor;
+    SerialTaskRunner& m_executor;
     std::unique_ptr<SenderTransport> m_transport;
     Now m_now;
     Schedule m_schedule;
+    Mutex m_stop_mutex;
     Mutex m_gate;
     bool m_stopped GUARDED_BY(m_gate){false};
     std::map<uint256, Payment> m_payments GUARDED_BY(m_gate);
@@ -213,9 +215,9 @@ struct SenderService::State : std::enable_shared_from_this<State> {
     mutable Mutex m_views_mutex;
     std::map<uint256, PaymentSnapshot> m_views GUARDED_BY(m_views_mutex);
 
-    explicit State(CWallet& wallet, std::shared_ptr<util::TaskRunnerInterface> executor,
+    explicit State(CWallet& wallet, SerialTaskRunner& executor,
                    std::unique_ptr<SenderTransport> transport, Now now, Schedule schedule)
-        : m_wallet{wallet}, m_executor{std::move(executor)}, m_transport{std::move(transport)}, m_now{std::move(now)}, m_schedule{std::move(schedule)} {}
+        : m_wallet{wallet}, m_executor{executor}, m_transport{std::move(transport)}, m_now{std::move(now)}, m_schedule{std::move(schedule)} {}
 
     static Record StoredRecord(const Payment& payment)
     {
@@ -292,7 +294,7 @@ struct SenderService::State : std::enable_shared_from_this<State> {
 
     void Queue(const uint256& id, std::function<void(State&, Payment&)> fn)
     {
-        m_executor->insert([weak = weak_from_this(), id, fn = std::move(fn)] {
+        m_executor.insert([weak = weak_from_this(), id, fn = std::move(fn)] {
             if (auto state = weak.lock()) {
                 LOCK(state->m_gate);
                 if (state->m_stopped) return;
@@ -1080,11 +1082,6 @@ struct SenderService::State : std::enable_shared_from_this<State> {
         ApplySettlement(payment);
         if (const auto refusal = FallbackRefusal(payment)) return Refuse(payment, *refusal);
 
-        if (payment.original_presence == TransactionPresence::Mempool) {
-            Update(payment);
-            return;
-        }
-
         if (payment.original_presence != TransactionPresence::Missing) {
             if (!CheckKnownOriginal(payment) || !EndNegotiation(payment)) return;
 
@@ -1102,9 +1099,9 @@ struct SenderService::State : std::enable_shared_from_this<State> {
     }
 };
 
-SenderService::SenderService(CWallet& wallet, std::shared_ptr<util::TaskRunnerInterface> executor,
+SenderService::SenderService(CWallet& wallet, SerialTaskRunner& executor,
                              std::unique_ptr<SenderTransport> transport, Now now, Schedule schedule)
-    : m_state{std::make_shared<State>(wallet, std::move(executor), std::move(transport), std::move(now), std::move(schedule))} {}
+    : m_state{std::make_shared<State>(wallet, executor, std::move(transport), std::move(now), std::move(schedule))} {}
 
 SenderService::~SenderService() { Stop(); }
 
@@ -1181,26 +1178,29 @@ void SenderService::Refresh(const uint256& id)
 
 void SenderService::Stop()
 {
-    LOCK(m_state->m_gate);
-    if (m_state->m_stopped) return;
-    m_state->m_stopped = true;
+    LOCK(m_state->m_stop_mutex);
+    {
+        LOCK(m_state->m_gate);
+        if (m_state->m_stopped) return;
+        m_state->m_stopped = true;
 
-    for (auto& [id, payment] : m_state->m_payments) {
-        try {
-            if (!payment.exposed && !payment.selected && !payment.settlement) {
-                if (m_state->EndNegotiation(payment)) (void)m_state->AbandonUnexposed(payment);
-            } else {
-                m_state->RetireRequest(payment);
+        for (auto& [id, payment] : m_state->m_payments) {
+            try {
+                if (!payment.exposed && !payment.selected && !payment.settlement) {
+                    if (m_state->EndNegotiation(payment)) (void)m_state->AbandonUnexposed(payment);
+                } else {
+                    m_state->RetireRequest(payment);
+                }
+            } catch (const std::bad_alloc&) {
+                throw;
+            } catch (const std::exception&) {
+                m_state->StorageFailure(payment, "wallet shutdown operation failed; effects require reconciliation");
             }
-        } catch (const std::bad_alloc&) {
-            throw;
-        } catch (const std::exception&) {
-            m_state->StorageFailure(payment, "wallet shutdown operation failed; effects require reconciliation");
-        }
 
-        payment.session.reset();
-        if (!payment.selected && !payment.settlement) payment.phase = PaymentPhase::Stopped;
-        m_state->Update(payment);
+            payment.session.reset();
+            if (!payment.selected && !payment.settlement) payment.phase = PaymentPhase::Stopped;
+            m_state->Update(payment);
+        }
     }
 
     m_state->m_transport->Stop();

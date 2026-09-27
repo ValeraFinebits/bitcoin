@@ -10,7 +10,6 @@
 #include <policy/feerate.h>
 #include <primitives/transaction.h>
 #include <uint256.h>
-#include <util/task_runner.h>
 
 #include <chrono>
 #include <functional>
@@ -18,6 +17,8 @@
 #include <optional>
 #include <string>
 #include <utility>
+
+class SerialTaskRunner;
 
 namespace wallet {
 class CWallet;
@@ -131,7 +132,7 @@ public:
     using Now = std::function<Clock::time_point()>;
     using Schedule = std::function<void(std::chrono::milliseconds, std::function<void()>)>;
 
-    explicit SenderService(CWallet& wallet, std::shared_ptr<util::TaskRunnerInterface> executor,
+    explicit SenderService(CWallet& wallet, SerialTaskRunner& executor,
                            std::unique_ptr<SenderTransport> transport, Now now, Schedule schedule);
     ~SenderService();
 
