@@ -37,6 +37,11 @@ add_library(bitcoin_wallet STATIC EXCLUDE_FROM_ALL
   walletdb.cpp
   walletutil.cpp
 )
+if(ENABLE_PAYJOIN)
+  target_sources(bitcoin_wallet PRIVATE payjoin/sender.cpp)
+  target_link_libraries(bitcoin_wallet PRIVATE bitcoin_payjoin_ffi)
+endif()
+
 target_link_libraries(bitcoin_wallet
   PRIVATE
     core_interface
