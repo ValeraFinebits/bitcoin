@@ -688,12 +688,13 @@ struct SenderService::State : std::enable_shared_from_this<State> {
     {
         const bool was_exposed = payment.retired_request->was_exposed;
         payment.retired_request.reset();
-        if (result.delivery != Delivery::NotSent || payment.phase != PaymentPhase::Cancelled ||
-            was_exposed || payment.selected || payment.settlement || payment.storage.released) {
+        if (result.delivery != Delivery::NotSent || was_exposed || payment.selected ||
+            payment.settlement || payment.storage.released) {
             return;
         }
 
-        if (!RestoreDisclosure(payment, was_exposed) || !AbandonUnexposed(payment)) return;
+        if (!RestoreDisclosure(payment, was_exposed)) return;
+        if (payment.phase == PaymentPhase::Cancelled && !AbandonUnexposed(payment)) return;
         Update(payment);
     }
 
