@@ -6,18 +6,14 @@
 #define BITCOIN_PAYJOIN_TRANSPORT_H
 
 #include <payjoin/client.h>
-#include <util/expected.h>
 
 #include <chrono>
 #include <cstdint>
 #include <functional>
 #include <string>
-#include <string_view>
 #include <vector>
 
 namespace wallet::payjoin {
-
-[[nodiscard]] util::Expected<void, PayjoinError> CheckRelayUrl(std::string_view relay);
 
 enum class SubmitResult {
     Accepted,
