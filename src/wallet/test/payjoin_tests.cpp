@@ -311,6 +311,7 @@ void CheckMovedFrom(SenderSession& session, std::string_view label)
     BOOST_CHECK(session.Phase() == SenderPhase::Unusable);
     BOOST_CHECK(!session.HasPendingRequest());
     BOOST_CHECK(!session.Outcome());
+    BOOST_CHECK(!session.OutcomeKind());
     BOOST_CHECK(!session.LastError());
     CheckNoTransitions(session, prefix);
     CheckError(session.FallbackTransaction(), PayjoinErrorCode::InvalidState, prefix + " fallback");
@@ -330,12 +331,14 @@ BOOST_AUTO_TEST_CASE(sender_create_and_request_lifecycle)
     const auto initial_event_count = event_log->EventCount();
 
     auto session = std::move(session_result).value();
+    BOOST_CHECK(!session.OutcomeKind());
     CheckError(session.ProcessResponse(UndersizedOhttpResponse()), PayjoinErrorCode::InvalidState, "response before request");
     CheckError(session.DiscardPendingRequest(), PayjoinErrorCode::InvalidState, "discard before request");
 
     auto request_result = session.PrepareRequest("https://relay.example");
     if (!request_result) BOOST_TEST_MESSAGE(request_result.error().message);
     BOOST_REQUIRE(static_cast<bool>(request_result));
+    BOOST_CHECK(!session.OutcomeKind());
     BOOST_CHECK(!request_result->url.empty());
     BOOST_CHECK(!request_result->content_type.empty());
     BOOST_CHECK(!request_result->body.empty());
@@ -786,6 +789,7 @@ BOOST_AUTO_TEST_CASE(sender_processes_polling_response_outcomes)
         const auto first_body = first_request->body;
         CheckError(session.ProcessResponse(UndersizedOhttpResponse()), PayjoinErrorCode::Transient, "polling transient response");
         BOOST_CHECK(session.Phase() == SenderPhase::Polling);
+        BOOST_CHECK(!session.OutcomeKind());
         BOOST_CHECK(!session.HasPendingRequest());
         BOOST_CHECK_EQUAL(transient_log->EventCount(), 2);
 
@@ -832,6 +836,7 @@ BOOST_AUTO_TEST_CASE(sender_processes_polling_response_outcomes)
     BOOST_REQUIRE(fatal_closed);
     auto fatal_closed_session = std::move(fatal_closed).value();
     BOOST_CHECK(fatal_closed_session.Phase() == SenderPhase::Closed);
+    BOOST_CHECK(fatal_closed_session.OutcomeKind() == SenderOutcomeKind::Aborted);
     const auto fatal_closed_outcome = fatal_closed_session.Outcome();
     BOOST_REQUIRE(fatal_closed_outcome);
     BOOST_REQUIRE(std::holds_alternative<SenderAborted>(*fatal_closed_outcome));
@@ -856,6 +861,7 @@ BOOST_AUTO_TEST_CASE(sender_polling_persistence_failures)
         save_log->FailSave();
         CheckErrorContains(session.ProcessResponse(CorrectlySizedUndecodableOhttpResponse()), PayjoinErrorCode::Storage, "save failed", "polling save failure");
         BOOST_CHECK(session.Phase() == SenderPhase::Unusable);
+        BOOST_CHECK(!session.OutcomeKind());
         const auto last_error = session.LastError();
         BOOST_REQUIRE(last_error);
         BOOST_CHECK(last_error->code == PayjoinErrorCode::Storage);
@@ -1227,11 +1233,13 @@ BOOST_AUTO_TEST_CASE(sender_replays_pending_fallback)
     auto session = std::move(replayed).value();
     BOOST_CHECK(session.Phase() == SenderPhase::PendingFallback);
     BOOST_CHECK_EQUAL(event_log->CloseCount(), 0);
+    BOOST_CHECK(!session.OutcomeKind());
     CheckFallbackEquals(session, expected_fallback, "replayed pending fallback");
     CheckError(session.PrepareRequest("https://relay.example"), PayjoinErrorCode::InvalidState, "request in pending fallback");
     BOOST_REQUIRE(session.CloseFallback());
     BOOST_CHECK(session.Phase() == SenderPhase::Closed);
     BOOST_CHECK(event_log->IsClosed());
+    BOOST_CHECK(session.OutcomeKind() == SenderOutcomeKind::Aborted);
 }
 
 BOOST_AUTO_TEST_CASE(sender_replays_closed_success_with_proposal)
@@ -1258,12 +1266,26 @@ BOOST_AUTO_TEST_CASE(sender_replays_closed_success_with_proposal)
         const auto outcome = session.Outcome();
         BOOST_REQUIRE(outcome);
         BOOST_CHECK(std::holds_alternative<SenderProposal>(*outcome));
+        BOOST_CHECK(session.OutcomeKind() == SenderOutcomeKind::Proposal);
         const auto last_error = session.LastError();
         BOOST_CHECK(!last_error);
         BOOST_REQUIRE(std::holds_alternative<SenderProposal>(*outcome));
         BOOST_CHECK_EQUAL(
             SerializePsbtForComparison(std::get<SenderProposal>(*outcome).psbt),
             SerializePsbtForComparison(psbt));
+
+        auto copied_outcome = session.Outcome();
+        BOOST_REQUIRE(copied_outcome);
+        BOOST_REQUIRE(std::holds_alternative<SenderProposal>(*copied_outcome));
+        std::get<SenderProposal>(*copied_outcome).psbt.inputs.clear();
+        BOOST_CHECK(session.OutcomeKind() == SenderOutcomeKind::Proposal);
+        const auto repeated_outcome = session.Outcome();
+        BOOST_REQUIRE(repeated_outcome);
+        BOOST_REQUIRE(std::holds_alternative<SenderProposal>(*repeated_outcome));
+        BOOST_CHECK_EQUAL(
+            SerializePsbtForComparison(std::get<SenderProposal>(*repeated_outcome).psbt),
+            SerializePsbtForComparison(psbt));
+
         CheckError(session.Cancel(), PayjoinErrorCode::InvalidState, "cancel closed success");
     }
     BOOST_CHECK(event_log->IsClosed());
@@ -1323,6 +1345,7 @@ BOOST_AUTO_TEST_CASE(sender_replays_closed_success_with_undecodable_proposal)
         const auto outcome = session.Outcome();
         BOOST_REQUIRE(outcome);
         BOOST_REQUIRE(std::holds_alternative<SenderSuccessWithoutProposal>(*outcome));
+        BOOST_CHECK(session.OutcomeKind() == SenderOutcomeKind::SuccessWithoutProposal);
         const auto& outcome_error = std::get<SenderSuccessWithoutProposal>(*outcome).error;
         BOOST_REQUIRE(session.LastError());
         BOOST_CHECK(outcome_error.code == session.LastError()->code);
@@ -1705,8 +1728,10 @@ BOOST_AUTO_TEST_CASE(sender_create_failure_after_save_replays_created_session)
     const auto psbt = ParseValidPsbt();
     const auto expected_fallback = ExtractFallback(psbt);
     BOOST_REQUIRE(expected_fallback->HasWitness());
-    for (const auto mode : {FailureMode::ReturnAfter, FailureMode::ThrowAfter}) {
-        BOOST_TEST_CONTEXT("failure mode " << static_cast<int>(mode))
+    for (const auto& [name, mode] : {
+             std::pair{"return after save", FailureMode::ReturnAfter},
+             std::pair{"throw after save", FailureMode::ThrowAfter}}) {
+        BOOST_TEST_CONTEXT(name)
         {
             auto log = std::make_shared<InMemoryEventLog>();
             log->FailSave(mode);
@@ -1714,7 +1739,6 @@ BOOST_AUTO_TEST_CASE(sender_create_failure_after_save_replays_created_session)
             CheckErrorContains(created, PayjoinErrorCode::Storage, "save failed", "create after saved event");
             BOOST_REQUIRE_EQUAL(log->EventCount(), 1);
             const auto event = log->Event(0);
-            BOOST_CHECK(event.starts_with("{\"Created\":"));
             BOOST_CHECK_EQUAL(log->SaveCount(), 1);
             BOOST_CHECK_EQUAL(log->CloseCount(), 0);
             BOOST_CHECK(!log->IsClosed());

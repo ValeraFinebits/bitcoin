@@ -1,3 +1,5 @@
+set(PAYJOIN_FFI_TEST_UTILS @PAYJOIN_FFI_TEST_UTILS@)
+
 include(CMakeFindDependencyMacro)
 find_dependency(Threads)
 
