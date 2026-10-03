@@ -18,20 +18,22 @@
 #include <random.h>
 #include <scheduler.h>
 #include <serialize.h>
-#include <span.h>
 #include <streams.h>
 #include <sync.h>
 #include <util/expected.h>
 #include <util/result.h>
 #include <util/translation.h>
+#include <util/ui_change_type.h>
 #include <wallet/coincontrol.h>
 #include <wallet/db.h>
 #include <wallet/spend.h>
 #include <wallet/transaction.h>
+#include <wallet/types.h>
 #include <wallet/wallet.h>
 #include <wallet/walletdb.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -197,13 +199,17 @@ struct SenderService::State : std::enable_shared_from_this<State> {
 
         std::optional<SenderSession> session;
         Clock::time_point deadline;
-        uint64_t request{0};
-        bool request_was_exposed{false};
-        struct RetiredRequest {
+
+        struct RequestEvidence {
             uint64_t id;
             bool was_exposed;
+            std::atomic<bool> not_sent{false};
+
+            explicit RequestEvidence(uint64_t request_id, bool exposed_before_request) : id{request_id}, was_exposed{exposed_before_request} {}
         };
-        std::optional<RetiredRequest> retired_request;
+
+        std::shared_ptr<RequestEvidence> request;
+        std::shared_ptr<RequestEvidence> retired_request;
         uint64_t generation{0};
     };
 
@@ -602,13 +608,13 @@ struct SenderService::State : std::enable_shared_from_this<State> {
             return;
         }
 
-        payment.request = ++m_next_request;
-        payment.request_was_exposed = was_exposed;
-        const auto request_id = payment.request;
-        auto completion = [weak = weak_from_this(), id = payment.id, request_id](TransportResult result) {
+        payment.request = std::make_shared<Payment::RequestEvidence>(++m_next_request, was_exposed);
+        const auto request_id = payment.request->id;
+        auto completion = [weak = weak_from_this(), id = payment.id, evidence = payment.request](TransportResult result) {
+            if (result.delivery == Delivery::NotSent) evidence->not_sent = true;
             if (auto locked_state = weak.lock()) {
-                locked_state->Queue(id, [request_id, result = std::move(result)](State& queued_state, Payment& queued_payment) {
-                    if (queued_payment.request == request_id) {
+                locked_state->Queue(id, [request_id = evidence->id, result = std::move(result)](State& queued_state, Payment& queued_payment) {
+                    if (queued_payment.request && queued_payment.request->id == request_id) {
                         queued_state.Response(queued_payment, result);
                     } else if (queued_payment.retired_request && queued_payment.retired_request->id == request_id) {
                         queued_state.RetiredResponse(queued_payment, result);
@@ -616,10 +622,10 @@ struct SenderService::State : std::enable_shared_from_this<State> {
                 });
             }
         };
+
         const auto accepted = m_transport->Submit(request_id, std::move(*request), remaining, std::move(completion));
         if (accepted != SubmitResult::Accepted) {
-            payment.request = 0;
-            payment.request_was_exposed = false;
+            payment.request.reset();
             Discard(payment);
             if (!RestoreDisclosure(payment, was_exposed)) return;
             if (accepted == SubmitResult::Busy) {
@@ -643,9 +649,8 @@ struct SenderService::State : std::enable_shared_from_this<State> {
         if (result.delivery != Delivery::Response) {
             LogDebug(BCLog::NET, "Payjoin transport result %d (retryable %d)\n", static_cast<int>(result.delivery), result.retryable);
         }
-        const bool was_exposed = payment.request_was_exposed;
-        payment.request = 0;
-        payment.request_was_exposed = false;
+        const bool was_exposed = payment.request->was_exposed;
+        payment.request.reset();
 
         if (payment.phase != PaymentPhase::Negotiating) return;
         if (result.delivery == Delivery::NotSent && !RestoreDisclosure(payment, was_exposed)) return;
@@ -880,10 +885,9 @@ struct SenderService::State : std::enable_shared_from_this<State> {
     {
         ++payment.generation;
         if (payment.request) {
-            payment.retired_request = Payment::RetiredRequest{std::exchange(payment.request, 0), payment.request_was_exposed};
+            payment.retired_request = std::move(payment.request);
             m_transport->Cancel(payment.retired_request->id);
         }
-        payment.request_was_exposed = false;
         Discard(payment);
     }
 
@@ -1237,10 +1241,29 @@ void SenderService::Stop()
 
         for (auto& [id, payment] : m_state->m_payments) {
             try {
+                m_state->RetireRequest(payment);
+            } catch (const std::bad_alloc&) {
+                throw;
+            } catch (const std::exception&) {
+                m_state->StorageFailure(payment, "wallet shutdown operation failed; effects require reconciliation");
+            }
+        }
+    }
+
+    m_state->m_transport->Stop();
+
+    {
+        LOCK(m_state->m_gate);
+        for (auto& [id, payment] : m_state->m_payments) {
+            try {
+                auto retired = std::move(payment.retired_request);
+                if (retired && retired->not_sent && !retired->was_exposed &&
+                    !payment.selected && !payment.settlement && !payment.storage.released) {
+                    (void)m_state->RestoreDisclosure(payment, false);
+                }
+
                 if (!payment.exposed && !payment.selected && !payment.settlement) {
                     if (m_state->EndNegotiation(payment)) (void)m_state->AbandonUnexposed(payment);
-                } else {
-                    m_state->RetireRequest(payment);
                 }
             } catch (const std::bad_alloc&) {
                 throw;
@@ -1253,7 +1276,5 @@ void SenderService::Stop()
             m_state->Update(payment);
         }
     }
-
-    m_state->m_transport->Stop();
 }
 } // namespace wallet::payjoin
