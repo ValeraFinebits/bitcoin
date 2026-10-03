@@ -190,6 +190,29 @@ public:
     }
 };
 
+class ReservedTcpPort
+{
+    std::unique_ptr<Sock> m_socket{CreateSockOS(AF_INET, SOCK_STREAM, 0)};
+    uint16_t m_port{0};
+
+public:
+    ReservedTcpPort()
+    {
+        BOOST_REQUIRE(m_socket);
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        BOOST_REQUIRE_EQUAL(m_socket->Bind(reinterpret_cast<sockaddr*>(&address), sizeof(address)), 0);
+
+        socklen_t length = sizeof(address);
+        BOOST_REQUIRE_EQUAL(m_socket->GetSockName(reinterpret_cast<sockaddr*>(&address), &length), 0);
+        m_port = ntohs(address.sin_port);
+        BOOST_REQUIRE(m_port != 0);
+    }
+
+    uint16_t Port() const { return m_port; }
+};
+
 class HttpWireObserver
 {
     std::unique_ptr<Sock> m_socket{CreateSockOS(AF_INET, SOCK_STREAM, 0)};
@@ -677,8 +700,9 @@ BOOST_AUTO_TEST_CASE(http_transport_rejects_invalid_options_with_distinct_errors
 
 BOOST_AUTO_TEST_CASE(http_transport_connection_failure_is_retryable_not_sent)
 {
+    ReservedTcpPort port;
     HttpSenderTransport http;
-    const auto failed = Post(http, {"http://127.0.0.1:1/payjoin", "text/plain", {}});
+    const auto failed = Post(http, {strprintf("http://127.0.0.1:%u/payjoin", port.Port()), "text/plain", {}});
     BOOST_CHECK(failed.delivery == Delivery::NotSent);
     BOOST_CHECK(failed.retryable);
     http.Stop();
@@ -722,7 +746,8 @@ BOOST_AUTO_TEST_CASE(http_transport_proxy_configuration_and_environment)
     BOOST_CHECK_EQUAL(target.Connections(), 1);
     BOOST_CHECK_EQUAL(target.Requests().size(), 1);
 
-    options.proxy = "http://user:private-password@127.0.0.1:1";
+    ReservedTcpPort unavailable_port;
+    options.proxy = strprintf("http://user:private-password@127.0.0.1:%u", unavailable_port.Port());
     HttpSenderTransport unavailable{options};
     std::promise<TransportResult> completion;
     auto result = completion.get_future();
