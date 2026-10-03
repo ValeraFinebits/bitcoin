@@ -108,6 +108,8 @@ extern "C" CURLMcode __wrap_curl_multi_perform(CURLM* multi, int* running)
 
 namespace wallet::payjoin {
 namespace {
+constexpr size_t TEST_REQUEST_BODY_SIZE{512};
+
 #ifdef __linux__
 class MultiProbeCleanup
 {
@@ -197,8 +199,9 @@ class HttpWireObserver
     Mutex m_mutex;
     std::vector<std::string> m_requests GUARDED_BY(m_mutex);
     std::atomic<int> m_connections{0};
+    std::promise<void> m_request_received;
 
-    void Run(bool respond, bool chunked, bool partial, bool allow_disconnect, const std::optional<std::string>& reply) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)
+    void Run(size_t expected_body_size, bool respond, bool chunked, bool partial, bool allow_disconnect, const std::optional<std::string>& reply) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)
     {
         while (!m_interrupt) {
             Sock::Event ready{};
@@ -248,7 +251,7 @@ class HttpWireObserver
 
                 request.append(buffer.data(), count);
                 const auto end = request.find("\r\n\r\n");
-                if (end != std::string::npos && request.size() >= end + 4 + 512) {
+                if (end != std::string::npos && request.size() >= end + 4 + expected_body_size) {
                     complete = true;
                     break;
                 }
@@ -260,6 +263,7 @@ class HttpWireObserver
             {
                 LOCK(m_mutex);
                 m_requests.push_back(std::move(request));
+                if (m_requests.size() == 1) m_request_received.set_value();
             }
 
             if (respond && complete) {
@@ -293,7 +297,7 @@ class HttpWireObserver
 public:
     std::string m_url;
 
-    explicit HttpWireObserver(bool respond, bool chunked = false, bool partial = false, bool allow_disconnect = false,
+    explicit HttpWireObserver(size_t expected_body_size, bool respond, bool chunked = false, bool partial = false, bool allow_disconnect = false,
                               std::optional<std::string> reply = std::nullopt)
     {
         BOOST_REQUIRE(m_socket);
@@ -307,17 +311,17 @@ public:
         BOOST_REQUIRE_EQUAL(m_socket->GetSockName(reinterpret_cast<sockaddr*>(&address), &length), 0);
         m_url = strprintf("http://127.0.0.1:%u/payjoin", ntohs(address.sin_port));
 
-        m_worker = std::thread{[this, respond, chunked, partial, allow_disconnect, reply = std::move(reply)] {
+        m_worker = std::thread{[this, expected_body_size, respond, chunked, partial, allow_disconnect, reply = std::move(reply)] {
             try {
-                Run(respond, chunked, partial, allow_disconnect, reply);
+                Run(expected_body_size, respond, chunked, partial, allow_disconnect, reply);
             } catch (...) {
                 m_error = std::current_exception();
             }
         }};
     }
 
-    explicit HttpWireObserver(std::string reply, bool allow_disconnect = false)
-        : HttpWireObserver{true, false, false, allow_disconnect, std::move(reply)} {}
+    explicit HttpWireObserver(size_t expected_body_size, std::string reply, bool allow_disconnect = false)
+        : HttpWireObserver{expected_body_size, true, false, false, allow_disconnect, std::move(reply)} {}
 
     ~HttpWireObserver()
     {
@@ -335,6 +339,8 @@ public:
         LOCK(m_mutex);
         return m_requests;
     }
+
+    auto RequestReceived() { return m_request_received.get_future(); }
 
     int Connections() const { return m_connections; }
 };
@@ -384,11 +390,11 @@ BOOST_AUTO_TEST_CASE(http_transport_response_size_boundaries)
                     response.append(reinterpret_cast<const char*>(payload.data()), size);
                 }
 
-                HttpWireObserver observer{std::move(response), size > limit};
+                HttpWireObserver observer{TEST_REQUEST_BODY_SIZE, std::move(response), size > limit};
                 HttpSenderTransport http;
                 HttpTestCleanup cleanup{http};
 
-                const auto result = Post(http, {observer.m_url, "application/octet-stream", std::vector<unsigned char>(512, 'X')});
+                const auto result = Post(http, {observer.m_url, "application/octet-stream", std::vector<unsigned char>(TEST_REQUEST_BODY_SIZE, 'X')});
                 if (size <= limit) {
                     BOOST_REQUIRE_MESSAGE(result.delivery == Delivery::Response, result.diagnostic);
                     BOOST_CHECK(result.body == payload);
@@ -413,13 +419,13 @@ BOOST_AUTO_TEST_CASE(http_transport_does_not_follow_post_redirects)
     for (const int status : {307, 308}) {
         BOOST_TEST_CONTEXT("redirect status=" << status)
         {
-            HttpWireObserver destination{true};
-            HttpWireObserver origin{strprintf("HTTP/1.1 %d Redirect\r\nLocation: %s\r\nContent-Length: 8\r\nConnection: close\r\n\r\nredirect",
-                                              status, destination.m_url)};
+            HttpWireObserver destination{TEST_REQUEST_BODY_SIZE, true};
+            HttpWireObserver origin{TEST_REQUEST_BODY_SIZE, strprintf("HTTP/1.1 %d Redirect\r\nLocation: %s\r\nContent-Length: 8\r\nConnection: close\r\n\r\nredirect",
+                                                                      status, destination.m_url)};
             HttpSenderTransport http;
             HttpTestCleanup cleanup{http};
 
-            const auto result = Post(http, {origin.m_url, "application/octet-stream", std::vector<unsigned char>(512, 'X')});
+            const auto result = Post(http, {origin.m_url, "application/octet-stream", std::vector<unsigned char>(TEST_REQUEST_BODY_SIZE, 'X')});
             BOOST_CHECK(result.delivery == Delivery::Uncertain);
             BOOST_CHECK(!result.retryable);
             BOOST_CHECK(result.diagnostic.find(strprintf("status %d", status)) != std::string::npos);
@@ -430,7 +436,7 @@ BOOST_AUTO_TEST_CASE(http_transport_does_not_follow_post_redirects)
             const auto requests = origin.Requests();
             BOOST_REQUIRE_EQUAL(requests.size(), 1);
             BOOST_CHECK(requests.front().starts_with("POST /payjoin HTTP/1.1\r\n"));
-            BOOST_CHECK(requests.front().ends_with(std::string(512, 'X')));
+            BOOST_CHECK(requests.front().ends_with(std::string(TEST_REQUEST_BODY_SIZE, 'X')));
             BOOST_CHECK_EQUAL(origin.Connections(), 1);
             BOOST_CHECK(destination.Requests().empty());
             BOOST_CHECK_EQUAL(destination.Connections(), 0);
@@ -440,8 +446,8 @@ BOOST_AUTO_TEST_CASE(http_transport_does_not_follow_post_redirects)
 
 BOOST_AUTO_TEST_CASE(http_transport_one_submit_one_http11_body)
 {
-    HttpWireObserver observer{false};
-    SenderRequest request{observer.m_url, "application/octet-stream", std::vector<unsigned char>(512, 'X')};
+    HttpWireObserver observer{TEST_REQUEST_BODY_SIZE, false};
+    SenderRequest request{observer.m_url, "application/octet-stream", std::vector<unsigned char>(TEST_REQUEST_BODY_SIZE, 'X')};
     std::promise<TransportResult> completion;
     auto result = completion.get_future();
     std::atomic<int> callbacks{0};
@@ -461,15 +467,60 @@ BOOST_AUTO_TEST_CASE(http_transport_one_submit_one_http11_body)
     const auto requests = observer.Requests();
     BOOST_REQUIRE_EQUAL(requests.size(), 1);
     BOOST_CHECK(requests[0].starts_with("POST /payjoin HTTP/1.1\r\n"));
-    BOOST_CHECK(requests[0].ends_with(std::string(512, 'X')));
+    BOOST_CHECK(requests[0].ends_with(std::string(TEST_REQUEST_BODY_SIZE, 'X')));
+}
+
+BOOST_AUTO_TEST_CASE(http_transport_request_body_size_boundaries)
+{
+    for (const size_t size : {0, 1, 512, 513}) {
+        BOOST_TEST_CONTEXT("request bytes=" << size)
+        {
+            std::vector<unsigned char> payload(size);
+            for (size_t i = 0; i < size; ++i) {
+                payload[i] = i % 251;
+            }
+
+            HttpWireObserver observer{size, true};
+            auto received = observer.RequestReceived();
+            std::promise<TransportResult> completion;
+            auto result = completion.get_future();
+            std::atomic<int> callbacks{0};
+            HttpSenderTransport http;
+            HttpTestCleanup cleanup{http};
+
+            BOOST_REQUIRE(http.Submit(1, {observer.m_url, "application/octet-stream", payload}, std::chrono::seconds{3}, [&](TransportResult response) {
+                if (++callbacks == 1) completion.set_value(std::move(response));
+            }) == SubmitResult::Accepted);
+            const auto status = received.wait_for(std::chrono::seconds{5});
+            if (status != std::future_status::ready) observer.Check();
+            BOOST_REQUIRE(status == std::future_status::ready);
+            BOOST_REQUIRE(result.wait_for(std::chrono::seconds{5}) == std::future_status::ready);
+            const auto response = result.get();
+            BOOST_REQUIRE_MESSAGE(response.delivery == Delivery::Response, response.diagnostic);
+
+            http.Stop();
+            BOOST_CHECK_EQUAL(callbacks, 1);
+
+            observer.Check();
+            const auto requests = observer.Requests();
+            BOOST_REQUIRE_EQUAL(requests.size(), 1);
+            BOOST_CHECK_EQUAL(observer.Connections(), 1);
+            BOOST_CHECK(requests.front().starts_with("POST /payjoin HTTP/1.1\r\n"));
+            const auto end = requests.front().find("\r\n\r\n");
+            BOOST_REQUIRE(end != std::string::npos);
+            const std::vector<unsigned char> body{requests.front().begin() + end + 4, requests.front().end()};
+            BOOST_CHECK_EQUAL(body.size(), size);
+            BOOST_CHECK_EQUAL_COLLECTIONS(body.begin(), body.end(), payload.begin(), payload.end());
+        }
+    }
 }
 
 BOOST_AUTO_TEST_CASE(http_transport_reused_id_and_before_dispatch_cancellation)
 {
-    HttpWireObserver observer{true};
+    HttpWireObserver observer{TEST_REQUEST_BODY_SIZE, true};
     HttpTransportOptions options;
     options.max_requests = 2;
-    SenderRequest request{observer.m_url, "application/octet-stream", std::vector<unsigned char>(512, 'X')};
+    SenderRequest request{observer.m_url, "application/octet-stream", std::vector<unsigned char>(TEST_REQUEST_BODY_SIZE, 'X')};
     std::promise<void> first_callback, finish_callback;
     auto first = first_callback.get_future();
     auto finish = finish_callback.get_future();
@@ -517,12 +568,12 @@ BOOST_AUTO_TEST_CASE(http_transport_reused_id_and_before_dispatch_cancellation)
 
 BOOST_AUTO_TEST_CASE(http_transport_chunked_limit_and_plain_http_proxy)
 {
-    HttpWireObserver chunked{/*respond=*/true, /*chunked=*/true, /*partial=*/false, /*allow_disconnect=*/true};
+    HttpWireObserver chunked{TEST_REQUEST_BODY_SIZE, /*respond=*/true, /*chunked=*/true, /*partial=*/false, /*allow_disconnect=*/true};
     HttpTransportOptions options;
     options.max_response_bytes = 4;
     HttpSenderTransport bounded{options};
 
-    const auto limited = Post(bounded, {chunked.m_url, "application/octet-stream", std::vector<unsigned char>(512, 'X')});
+    const auto limited = Post(bounded, {chunked.m_url, "application/octet-stream", std::vector<unsigned char>(TEST_REQUEST_BODY_SIZE, 'X')});
     BOOST_CHECK(limited.delivery == Delivery::Uncertain);
     BOOST_CHECK(!limited.retryable);
     BOOST_CHECK(limited.body.size() <= 4);
@@ -530,12 +581,12 @@ BOOST_AUTO_TEST_CASE(http_transport_chunked_limit_and_plain_http_proxy)
     bounded.Stop();
     chunked.Check();
 
-    HttpWireObserver proxy{true};
+    HttpWireObserver proxy{TEST_REQUEST_BODY_SIZE, true};
     options.max_response_bytes = 1024;
     options.proxy = proxy.m_url;
     HttpSenderTransport proxied{options};
 
-    const auto response = Post(proxied, {"http://origin.invalid/payjoin", "application/octet-stream", std::vector<unsigned char>(512, 'X')});
+    const auto response = Post(proxied, {"http://origin.invalid/payjoin", "application/octet-stream", std::vector<unsigned char>(TEST_REQUEST_BODY_SIZE, 'X')});
     BOOST_CHECK(response.delivery == Delivery::Response);
 
     proxied.Stop();
@@ -547,7 +598,7 @@ BOOST_AUTO_TEST_CASE(http_transport_chunked_limit_and_plain_http_proxy)
 
 BOOST_AUTO_TEST_CASE(http_transport_defers_url_rejection)
 {
-    HttpWireObserver observer{true};
+    HttpWireObserver observer{TEST_REQUEST_BODY_SIZE, true};
     HttpSenderTransport http;
     HttpTestCleanup cleanup{http};
     std::atomic<int> callbacks{0};
@@ -555,7 +606,7 @@ BOOST_AUTO_TEST_CASE(http_transport_defers_url_rejection)
         return http.Submit(1, {url, content_type, {}}, std::chrono::seconds{1}, [&](auto) { ++callbacks; });
     };
 
-    const SenderRequest valid{observer.m_url, "text/plain", std::vector<unsigned char>(512, 'X')};
+    const SenderRequest valid{observer.m_url, "text/plain", std::vector<unsigned char>(TEST_REQUEST_BODY_SIZE, 'X')};
     BOOST_CHECK(Post(http, valid).delivery == Delivery::Response);
 
     uint64_t id{10};
@@ -635,9 +686,9 @@ BOOST_AUTO_TEST_CASE(http_transport_connection_failure_is_retryable_not_sent)
 
 BOOST_AUTO_TEST_CASE(http_transport_proxy_configuration_and_environment)
 {
-    HttpWireObserver target{true};
-    HttpWireObserver proxy{true};
-    const SenderRequest request{target.m_url, "text/plain", std::vector<unsigned char>(512, 'X')};
+    HttpWireObserver target{TEST_REQUEST_BODY_SIZE, true};
+    HttpWireObserver proxy{TEST_REQUEST_BODY_SIZE, true};
+    const SenderRequest request{target.m_url, "text/plain", std::vector<unsigned char>(TEST_REQUEST_BODY_SIZE, 'X')};
     ScopedEnvironment http_proxy{"http_proxy", proxy.m_url.c_str()};
     ScopedEnvironment upper_http_proxy{"HTTP_PROXY", proxy.m_url.c_str()};
     ScopedEnvironment https_proxy{"https_proxy", proxy.m_url.c_str()};
@@ -706,8 +757,8 @@ BOOST_AUTO_TEST_CASE(http_transport_proxy_configuration_and_environment)
 
 BOOST_AUTO_TEST_CASE(http_transport_queued_deadline_diagnostic)
 {
-    HttpWireObserver observer{true};
-    const SenderRequest request{observer.m_url, "application/octet-stream", std::vector<unsigned char>(512, 'X')};
+    HttpWireObserver observer{TEST_REQUEST_BODY_SIZE, true};
+    const SenderRequest request{observer.m_url, "application/octet-stream", std::vector<unsigned char>(TEST_REQUEST_BODY_SIZE, 'X')};
     std::promise<void> first_callback, finish_callback;
     auto first = first_callback.get_future();
     auto finish = finish_callback.get_future();
@@ -743,8 +794,8 @@ BOOST_AUTO_TEST_CASE(http_transport_queued_deadline_diagnostic)
 BOOST_AUTO_TEST_CASE(http_transport_cleanup_on_early_exit)
 {
     for (int stage = 0; stage < 3; ++stage) {
-        HttpWireObserver observer{/*respond=*/true, /*chunked=*/false, /*partial=*/false, /*allow_disconnect=*/true};
-        const SenderRequest request{observer.m_url, "application/octet-stream", std::vector<unsigned char>(512, 'X')};
+        HttpWireObserver observer{TEST_REQUEST_BODY_SIZE, /*respond=*/true, /*chunked=*/false, /*partial=*/false, /*allow_disconnect=*/true};
+        const SenderRequest request{observer.m_url, "application/octet-stream", std::vector<unsigned char>(TEST_REQUEST_BODY_SIZE, 'X')};
         std::promise<void> first_callback, finish_callback;
         auto first = first_callback.get_future();
         auto finish = finish_callback.get_future();
@@ -780,10 +831,10 @@ BOOST_AUTO_TEST_CASE(http_transport_cleanup_on_early_exit)
 
 BOOST_AUTO_TEST_CASE(http_transport_partial_response_is_retryable)
 {
-    HttpWireObserver observer{true, false, true};
+    HttpWireObserver observer{TEST_REQUEST_BODY_SIZE, true, false, true};
     HttpSenderTransport http;
 
-    const auto response = Post(http, {observer.m_url, "application/octet-stream", std::vector<unsigned char>(512, 'X')});
+    const auto response = Post(http, {observer.m_url, "application/octet-stream", std::vector<unsigned char>(TEST_REQUEST_BODY_SIZE, 'X')});
     BOOST_CHECK(response.delivery == Delivery::Uncertain);
     BOOST_CHECK(response.retryable);
     BOOST_CHECK(response.diagnostic.starts_with("HTTP transfer failed ("));
@@ -796,8 +847,8 @@ BOOST_AUTO_TEST_CASE(http_transport_partial_response_is_retryable)
 
 BOOST_AUTO_TEST_CASE(http_transport_stop_waits_for_entered_completion)
 {
-    HttpWireObserver observer{/*respond=*/true, /*chunked=*/false, /*partial=*/false, /*allow_disconnect=*/true};
-    const SenderRequest request{observer.m_url, "application/octet-stream", std::vector<unsigned char>(512, 'X')};
+    HttpWireObserver observer{TEST_REQUEST_BODY_SIZE, /*respond=*/true, /*chunked=*/false, /*partial=*/false, /*allow_disconnect=*/true};
+    const SenderRequest request{observer.m_url, "application/octet-stream", std::vector<unsigned char>(TEST_REQUEST_BODY_SIZE, 'X')};
     std::atomic<int> callbacks{0}, queued_callbacks{0};
     std::promise<void> callback_entered, callback_release, first_stopped, second_stopped;
     auto entered = callback_entered.get_future();
@@ -854,11 +905,11 @@ BOOST_AUTO_TEST_CASE(http_transport_stop_waits_for_entered_completion)
 
 BOOST_AUTO_TEST_CASE(http_transport_completion_exception_is_not_replayed)
 {
-    HttpWireObserver observer{true};
+    HttpWireObserver observer{TEST_REQUEST_BODY_SIZE, true};
     std::atomic<int> callbacks{0};
     std::promise<void> invoked;
     auto ready = invoked.get_future();
-    const SenderRequest request{observer.m_url, "application/octet-stream", std::vector<unsigned char>(512, 'X')};
+    const SenderRequest request{observer.m_url, "application/octet-stream", std::vector<unsigned char>(TEST_REQUEST_BODY_SIZE, 'X')};
     HttpSenderTransport http;
     HttpTestCleanup cleanup{http};
 
@@ -882,8 +933,8 @@ BOOST_AUTO_TEST_CASE(http_transport_idle_poll_failure_stops_worker)
     MultiFailureProbe probe;
     probe.m_fail_idle_poll = true;
     auto entered = probe.m_poll_entered.get_future();
-    HttpWireObserver observer{true};
-    const SenderRequest request{observer.m_url, "text/plain", std::vector<unsigned char>(512, 'X')};
+    HttpWireObserver observer{TEST_REQUEST_BODY_SIZE, true};
+    const SenderRequest request{observer.m_url, "text/plain", std::vector<unsigned char>(TEST_REQUEST_BODY_SIZE, 'X')};
     std::promise<TransportResult> completion;
     auto result = completion.get_future();
     std::atomic<int> callbacks{0}, unexpected_callbacks{0};
@@ -922,10 +973,10 @@ BOOST_AUTO_TEST_CASE(http_transport_active_multi_failures_complete_once)
             probe.m_fail_active_poll = !fail_perform;
             auto poll_entered = probe.m_poll_entered.get_future();
             auto perform_entered = probe.m_perform_entered.get_future();
-            HttpWireObserver observer{/*respond=*/false, /*chunked=*/false, /*partial=*/false, /*allow_disconnect=*/true};
+            HttpWireObserver observer{TEST_REQUEST_BODY_SIZE, /*respond=*/false, /*chunked=*/false, /*partial=*/false, /*allow_disconnect=*/true};
             HttpSenderTransport http;
 
-            const SenderRequest request{observer.m_url, "text/plain", std::vector<unsigned char>(512, 'X')};
+            const SenderRequest request{observer.m_url, "text/plain", std::vector<unsigned char>(TEST_REQUEST_BODY_SIZE, 'X')};
             std::promise<TransportResult> first_result, second_result;
             auto first = first_result.get_future();
             auto second = second_result.get_future();

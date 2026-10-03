@@ -1259,7 +1259,7 @@ void SenderService::Stop()
                 auto retired = std::move(payment.retired_request);
                 if (retired && retired->not_sent && !retired->was_exposed &&
                     !payment.selected && !payment.settlement && !payment.storage.released) {
-                    (void)m_state->RestoreDisclosure(payment, retired->was_exposed);
+                    (void)m_state->RestoreDisclosure(payment, false);
                 }
 
                 if (!payment.exposed && !payment.selected && !payment.settlement) {
