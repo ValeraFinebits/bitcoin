@@ -117,6 +117,7 @@ cmake_dependent_option(BUILD_KERNEL_TEST "Build tests for the experimental bitco
 option(ENABLE_WALLET "Enable wallet." ON)
 cmake_dependent_option(BUILD_WALLET_TOOL "Build bitcoin-wallet tool." ${BUILD_TESTS} "ENABLE_WALLET" OFF)
 cmake_dependent_option(ENABLE_PAYJOIN "Enable embedded Payjoin support." OFF "ENABLE_WALLET" OFF)
+option(BUILD_PAYJOIN_INTEGRATION_TESTS "Build isolated upstream TestServices integration tests" OFF)
 
 option(ENABLE_EXTERNAL_SIGNER "Enable external signer support." ON)
 option(WITH_ZMQ "Enable ZMQ notifications." OFF)
@@ -198,6 +199,16 @@ if(BUILD_FOR_FUZZING)
   target_compile_definitions(core_interface INTERFACE
     FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
   )
+endif()
+
+if(BUILD_PAYJOIN_INTEGRATION_TESTS)
+  if(NOT ENABLE_PAYJOIN)
+    message(FATAL_ERROR "BUILD_PAYJOIN_INTEGRATION_TESTS requires ENABLE_PAYJOIN (and ENABLE_WALLET)")
+  elseif(NOT BUILD_TESTS)
+    message(FATAL_ERROR "BUILD_PAYJOIN_INTEGRATION_TESTS requires BUILD_TESTS")
+  elseif(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    message(FATAL_ERROR "The TestServices integration workflow currently supports Linux")
+  endif()
 endif()
 
 #=============================
@@ -644,6 +655,12 @@ add_subdirectory(doc)
 if(ENABLE_PAYJOIN)
   # FindCURL prefers curl's own config package, including static dependencies.
   find_package(CURL 8.22 REQUIRED)
+  find_package(PayjoinFFI CONFIG REQUIRED)
+  if(BUILD_PAYJOIN_INTEGRATION_TESTS AND NOT PAYJOIN_FFI_TEST_UTILS)
+    message(FATAL_ERROR "Integration tests require the _test-utils PayjoinFFI package")
+  elseif(NOT BUILD_PAYJOIN_INTEGRATION_TESTS AND PAYJOIN_FFI_TEST_UTILS)
+    message(FATAL_ERROR "Production builds require the PayjoinFFI package without _test-utils")
+  endif()
 endif()
 
 add_subdirectory(src)

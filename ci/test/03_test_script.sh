@@ -196,6 +196,22 @@ if [ "$RUN_UNIT_TESTS" = "true" ]; then
     --timeout $(( TEST_RUNNER_TIMEOUT_FACTOR * 60 ))
 fi
 
+if [ "${RUN_PAYJOIN_INTEGRATION_TESTS:-false}" = "true" ]; then
+  integration_build="${BASE_ROOT_DIR}/build-payjoin-integration"
+  cmake -S "${BASE_ROOT_DIR}" -B "${integration_build}" \
+    "${CMAKE_ARGS[@]}" \
+    -DENABLE_PAYJOIN=ON \
+    -DBUILD_TESTS=ON \
+    -DBUILD_PAYJOIN_INTEGRATION_TESTS=ON \
+    "-DPayjoinFFI_DIR=${DEPENDS_DIR}/${HOST}/tests/payjoin-ffi/lib/cmake/PayjoinFFI"
+  cmake --build "${integration_build}" "${MAKEJOBS}" --target test_payjoin_integration
+  ctest --test-dir "${integration_build}" \
+    -L payjoin_integration \
+    --output-on-failure \
+    --no-tests=error \
+    -j1
+fi
+
 if [ "$RUN_FUNCTIONAL_TESTS" = "true" ]; then
   # parses TEST_RUNNER_EXTRA as an array which allows for multiple arguments such as TEST_RUNNER_EXTRA='--exclude "rpc_bind.py --ipv6"'
   eval "TEST_RUNNER_EXTRA=($TEST_RUNNER_EXTRA)"
