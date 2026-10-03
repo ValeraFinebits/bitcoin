@@ -29,3 +29,13 @@ usdt_linux_packages=systemtap
 # depends requires transitive packages to be registered as well.
 payjoin_linux_packages=payjoin_ffi curl openssl
 payjoin_linux_native_packages=native_payjoin_bindgen
+
+ifneq ($(PAYJOIN_TESTS),)
+ifneq ($(PAYJOIN_TESTS),1)
+$(error PAYJOIN_TESTS must be empty or 1)
+endif
+ifneq ($(PAYJOIN),1)
+$(error PAYJOIN_TESTS=1 requires PAYJOIN=1)
+endif
+payjoin_linux_packages+=payjoin_ffi_test
+endif
