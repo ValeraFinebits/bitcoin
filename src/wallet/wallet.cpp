@@ -771,6 +771,17 @@ void CWallet::SyncMalleatedTxMetadata(WalletBatch& batch, const CWalletTx& wtx)
     }
 }
 
+std::set<Txid> CWallet::GetSpendingTxids(const COutPoint& outpoint) const
+{
+    AssertLockHeld(cs_wallet);
+    std::set<Txid> result;
+    const auto [begin, end] = mapTxSpends.equal_range(outpoint);
+    for (auto it = begin; it != end; ++it) {
+        result.insert(it->second);
+    }
+    return result;
+}
+
 /**
  * Outpoint is spent if any non-conflicted transaction
  * spends it:

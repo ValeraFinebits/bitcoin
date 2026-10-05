@@ -1051,6 +1051,76 @@ BOOST_AUTO_TEST_CASE(sender_uncertain_registration_preserves_error_after_confirm
     CheckUnregisteredForeignSpend(*this, false, true);
 }
 
+BOOST_AUTO_TEST_CASE(sender_observation_uses_spending_index_before_original_is_recorded)
+{
+    m_transport->m_acceptance = SubmitResult::Busy;
+    auto intent = Intent();
+    intent.amount = 99 * COIN;
+    intent.uri.replace(intent.uri.find("amount=1"), 8, "amount=99");
+    const auto id = m_service->Start(intent);
+    m_queue->flush();
+    const auto original = m_service->Snapshot(id)->original;
+    BOOST_REQUIRE(original);
+    BOOST_REQUIRE_EQUAL(original->vin.size(), 2);
+
+    const auto sign = [&](CMutableTransaction tx) {
+        for (auto& input : tx.vin) {
+            input.scriptSig.clear();
+            input.scriptWitness.SetNull();
+        }
+        PartiallySignedTransaction psbt{tx, 0};
+        bool complete{false};
+        {
+            LOCK(m_sender->cs_wallet);
+            BOOST_REQUIRE(!m_sender->FillPSBT(psbt, {}, complete));
+        }
+        BOOST_REQUIRE(complete);
+        BOOST_REQUIRE(FinalizeAndExtractPSBT(psbt, tx));
+        return MakeTransactionRef(std::move(tx));
+    };
+
+    CMutableTransaction alternative{*original};
+    alternative.vout[0].nValue -= 1000;
+    const auto inactive = sign(std::move(alternative));
+    std::vector<CTransactionRef> confirmed;
+    for (const auto& input : original->vin) {
+        CMutableTransaction spend;
+        spend.vin.emplace_back(input.prevout);
+        const auto value = WITH_LOCK(m_sender->cs_wallet, return m_sender->GetWalletTx(input.prevout.hash)->GetTx()->vout.at(input.prevout.n).nValue);
+        spend.vout.emplace_back(value - 1000, m_receiver_coin->vout[0].scriptPubKey);
+        confirmed.push_back(sign(std::move(spend)));
+    }
+    {
+        LOCK(m_sender->cs_wallet);
+        BOOST_REQUIRE(m_sender->AddToWallet(inactive, TxStateInactive{}));
+    }
+    for (const auto& spend : confirmed) {
+        Confirm(spend);
+    }
+
+    {
+        LOCK(m_sender->cs_wallet);
+        BOOST_REQUIRE(!m_sender->GetWalletTx(original->GetHash()));
+        BOOST_CHECK(m_sender->GetSpendingTxids(COutPoint{m_receiver_coin->GetHash(), 0}).empty());
+        for (size_t i = 0; i < original->vin.size(); ++i) {
+            const std::set<Txid> spenders{inactive->GetHash(), confirmed[i]->GetHash()};
+            BOOST_CHECK(m_sender->GetSpendingTxids(original->vin[i].prevout) == spenders);
+        }
+    }
+    m_service->Refresh(id);
+    m_queue->flush();
+
+    const auto view = *m_service->Snapshot(id);
+    BOOST_REQUIRE(view.observed_spend);
+    BOOST_CHECK(view.observed_spend->kind == SpendKind::Other);
+    BOOST_CHECK(view.observed_spend->presence == TransactionPresence::Confirmed);
+    BOOST_CHECK(view.observed_spend->transaction->GetHash() == std::min(confirmed[0]->GetHash(), confirmed[1]->GetHash()));
+    BOOST_REQUIRE(view.settlement);
+    BOOST_CHECK(view.settlement->transaction == view.observed_spend->transaction);
+    BOOST_CHECK(!view.owns_inputs);
+    BOOST_CHECK(ReadStoredPayment(id).released);
+}
+
 BOOST_AUTO_TEST_CASE(sender_initial_dispatch_trusts_persistent_memory_lock)
 {
     const auto id = m_service->Start(Intent());
