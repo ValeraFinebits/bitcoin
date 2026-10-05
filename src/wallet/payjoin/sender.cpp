@@ -165,6 +165,27 @@ public:
 };
 } // namespace
 
+util::Expected<PayjoinUriInfo, std::string> ValidatePaymentIntent(const PaymentIntent& intent)
+{
+    if (!MoneyRange(intent.amount) || intent.amount == 0 || !MoneyRange(intent.max_fee) ||
+        intent.fee_rate.GetFeePerK() <= 0 || intent.timeout <= std::chrono::milliseconds::zero() ||
+        intent.timeout > std::chrono::hours{24} || intent.poll_interval <= std::chrono::milliseconds::zero() ||
+        intent.poll_interval > intent.timeout) {
+        return util::Unexpected<std::string>{"invalid amount, fee policy or timeout"};
+    }
+
+    // TODO: Reject v1 before admission and reservation once the FFI exposes
+    // a typed v2 check: https://github.com/payjoin/rust-payjoin/issues/1849.
+    const auto uri = ParsePayjoinUri(intent.uri);
+    if (!uri) return util::Unexpected<std::string>{uri.error().message};
+
+    const auto destination = DecodeDestination(uri->address);
+    if (!IsValidDestination(destination) || (uri->amount_sats && *uri->amount_sats != static_cast<uint64_t>(intent.amount))) {
+        return util::Unexpected<std::string>{"destination network or amount mismatch"};
+    }
+    return *uri;
+}
+
 struct SenderService::State : std::enable_shared_from_this<State> {
     struct Payment {
         PaymentIntent intent;
@@ -374,25 +395,13 @@ struct SenderService::State : std::enable_shared_from_this<State> {
         if (payment.phase != PaymentPhase::Queued) return;
 
         const auto& intent = payment.intent;
-        if (!MoneyRange(intent.amount) || intent.amount == 0 || !MoneyRange(intent.max_fee) ||
-            intent.fee_rate.GetFeePerK() <= 0 || intent.timeout <= std::chrono::milliseconds::zero() ||
-            intent.timeout > std::chrono::hours{24} || intent.poll_interval <= std::chrono::milliseconds::zero() ||
-            intent.poll_interval > intent.timeout) {
-            Fail(payment, PaymentIssue::InvalidIntent, "invalid amount, fee policy or timeout");
-            return;
-        }
-
-        const auto uri = ParsePayjoinUri(intent.uri);
+        const auto uri = ValidatePaymentIntent(intent);
         if (!uri) {
-            Fail(payment, PaymentIssue::InvalidIntent, uri.error().message);
+            Fail(payment, PaymentIssue::InvalidIntent, uri.error());
             return;
         }
 
         const auto destination = DecodeDestination(uri->address);
-        if (!IsValidDestination(destination) || (uri->amount_sats && *uri->amount_sats != static_cast<uint64_t>(intent.amount))) {
-            Fail(payment, PaymentIssue::InvalidIntent, "destination network or amount mismatch");
-            return;
-        }
         LOCK(m_wallet.cs_wallet);
         CCoinControl control;
         control.m_feerate = intent.fee_rate;

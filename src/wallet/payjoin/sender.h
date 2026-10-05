@@ -6,10 +6,12 @@
 #define BITCOIN_WALLET_PAYJOIN_SENDER_H
 
 #include <consensus/amount.h>
+#include <payjoin/client.h>
 #include <payjoin/transport.h>
 #include <policy/feerate.h>
 #include <primitives/transaction.h>
 #include <uint256.h>
+#include <util/expected.h>
 
 #include <chrono>
 #include <functional>
@@ -124,6 +126,8 @@ struct PaymentIntent {
     std::chrono::milliseconds timeout{std::chrono::minutes{2}};
     std::chrono::milliseconds poll_interval{std::chrono::seconds{1}};
 };
+
+util::Expected<PayjoinUriInfo, std::string> ValidatePaymentIntent(const PaymentIntent& intent);
 
 class SenderService
 {
