@@ -979,14 +979,16 @@ struct SenderService::State : std::enable_shared_from_this<State> {
         payment.observed_spend.reset();
 
         payment.locks_verified = true;
-        std::set<COutPoint> inputs;
+        std::set<Txid> candidates;
         for (const auto& input : payment.original->vin) {
-            inputs.insert(input.prevout);
             payment.locks_verified &= HasPersistentMemoryLock(input.prevout);
+            const auto spenders = m_wallet.GetSpendingTxids(input.prevout);
+            candidates.insert(spenders.begin(), spenders.end());
         }
 
-        for (const auto& [txid, wtx] : m_wallet.mapWallet) {
-            if (std::none_of(wtx.GetTx()->vin.begin(), wtx.GetTx()->vin.end(), [&](const auto& input) { return inputs.contains(input.prevout); })) continue;
+        for (const auto& txid : candidates) {
+            const auto* wtx = m_wallet.GetWalletTx(txid);
+            if (!wtx) continue;
 
             const bool is_original = txid == payment.original->GetHash();
             const bool is_selected = !is_original && payment.selected && txid == payment.selected->GetHash();
@@ -996,7 +998,7 @@ struct SenderService::State : std::enable_shared_from_this<State> {
             } else if (is_selected) {
                 presence = payment.selected_presence;
             } else {
-                presence = Presence(&wtx);
+                presence = Presence(wtx);
             }
 
             if (presence != TransactionPresence::Confirmed && presence != TransactionPresence::Mempool) continue;
@@ -1008,7 +1010,7 @@ struct SenderService::State : std::enable_shared_from_this<State> {
                 kind = SpendKind::Selected;
             }
 
-            payment.observed_spend = SpendObservation{wtx.GetTx(), kind, presence};
+            payment.observed_spend = SpendObservation{wtx->GetTx(), kind, presence};
             if (presence != TransactionPresence::Confirmed) continue;
             break;
         }
