@@ -14,11 +14,13 @@
 #include <payjoin/client.h>
 #include <payjoin/http_transport.h>
 #include <payjoin/transport.h>
+#include <policy/policy.h>
 #include <primitives/block.h>
 #include <primitives/transaction.h>
 #include <psbt.h>
 #include <pubkey.h>
 #include <scheduler.h>
+#include <script/interpreter.h>
 #include <script/script.h>
 #include <script/solver.h>
 #include <serialize.h>
@@ -294,7 +296,7 @@ struct IntegrationFixture : SenderFixture {
         auto held = Forwarder().Capture();
         BOOST_REQUIRE_MESSAGE(held.result.delivery == Delivery::Response, held.result.diagnostic);
         held.complete(held.result);
-        m_queue->flush();
+        Flush();
     }
 
     std::shared_ptr<::payjoin::UncheckedOriginalPayload> ReceiverOriginal()
@@ -412,15 +414,15 @@ enum class UtxoFields {
 void CheckReceiverUtxoFields(IntegrationFixture& fixture, UtxoFields fields)
 {
     const auto id = fixture.m_service->Start(fixture.Intent());
-    fixture.m_queue->flush();
+    fixture.Flush();
     fixture.Deliver();
 
-    CKey unused_wallet_key;
     if (fields == UtxoFields::WalletScript) {
-        unused_wallet_key.MakeNewKey(true);
         LOCK(fixture.m_sender->cs_wallet);
-        CreateDescriptor(*fixture.m_sender, "wpkh(" + EncodeSecret(unused_wallet_key) + ")", true);
-        const auto script = GetScriptForDestination(WitnessV0KeyHash{unused_wallet_key.GetPubKey()});
+
+        CreateDescriptor(*fixture.m_sender, "wpkh(" + EncodeSecret(fixture.m_receiver_key) + ")", true);
+        const auto script = fixture.m_receiver_coin->vout[0].scriptPubKey;
+        BOOST_REQUIRE(!fixture.m_sender->GetWalletTx(fixture.m_receiver_coin->GetHash()));
         for (const auto& input : fixture.m_service->Snapshot(id)->original->vin) {
             const auto* parent = fixture.m_sender->GetWalletTx(input.prevout.hash);
             BOOST_REQUIRE(parent);
@@ -460,7 +462,6 @@ void CheckReceiverUtxoFields(IntegrationFixture& fixture, UtxoFields fields)
             }
             case UtxoFields::WalletScript:
                 input.non_witness_utxo.reset();
-                input.witness_utxo.scriptPubKey = GetScriptForDestination(WitnessV0KeyHash{unused_wallet_key.GetPubKey()});
                 BOOST_REQUIRE(!WITH_LOCK(fixture.m_sender->cs_wallet, return fixture.m_sender->IsMine(input.GetOutPoint())));
                 BOOST_REQUIRE(WITH_LOCK(fixture.m_sender->cs_wallet, return fixture.m_sender->IsMine(input.witness_utxo)));
                 break;
@@ -475,6 +476,21 @@ void CheckReceiverUtxoFields(IntegrationFixture& fixture, UtxoFields fields)
         }
     });
     BOOST_REQUIRE(modified);
+
+    if (fields == UtxoFields::WalletScript) {
+        const auto tx = psbt.GetUnsignedTx();
+        BOOST_REQUIRE(tx);
+        const auto receiver_out = COutPoint{fixture.m_receiver_coin->GetHash(), 0};
+        const auto input = std::find_if(tx->vin.begin(), tx->vin.end(), [&](const auto& in) { return in.prevout == receiver_out; });
+        BOOST_REQUIRE(input != tx->vin.end());
+
+        const size_t index = input - tx->vin.begin();
+        const auto& utxo = fixture.m_receiver_coin->vout[0];
+        BOOST_REQUIRE(psbt.inputs[index].witness_utxo == utxo);
+        BOOST_REQUIRE(VerifyScript(psbt.inputs[index].final_script_sig, utxo.scriptPubKey,
+                                   &psbt.inputs[index].final_script_witness, STANDARD_SCRIPT_VERIFY_FLAGS,
+                                   MutableTransactionSignatureChecker{&*tx, static_cast<unsigned int>(index), utxo.nValue, MissingDataBehavior::FAIL}));
+    }
 
     if (fields == UtxoFields::PreviousTransactionHash) {
         DataStream bytes;
@@ -547,7 +563,7 @@ void CheckReceiverUtxoFields(IntegrationFixture& fixture, UtxoFields fields)
 void CheckQueuedProposal(IntegrationFixture& fixture, bool cancel)
 {
     const auto id = fixture.m_service->Start(fixture.Intent());
-    fixture.m_queue->flush();
+    fixture.Flush();
     fixture.Deliver();
 
     const auto psbt = fixture.Proposal();
@@ -560,7 +576,7 @@ void CheckQueuedProposal(IntegrationFixture& fixture, bool cancel)
 
     if (!cancel) {
         pending.complete(std::move(pending.result));
-        fixture.m_queue->flush();
+        fixture.Flush();
 
         const auto view = *fixture.m_service->Snapshot(id);
         BOOST_REQUIRE_MESSAGE(view.node_accepted, view.diagnostic);
@@ -584,7 +600,7 @@ void CheckQueuedProposal(IntegrationFixture& fixture, bool cancel)
         journal_after_cancel = fixture.Journal(id);
     });
     pending.complete(std::move(pending.result));
-    fixture.m_queue->flush();
+    fixture.Flush();
 
     BOOST_REQUIRE(after_cancel);
     BOOST_REQUIRE(after_cancel->phase == PaymentPhase::Cancelled);
@@ -617,7 +633,7 @@ void CheckProposalDeadline(IntegrationFixture& fixture, std::chrono::millisecond
     auto intent = fixture.Intent();
     intent.timeout = std::chrono::seconds{10};
     const auto id = fixture.m_service->Start(intent);
-    fixture.m_queue->flush();
+    fixture.Flush();
     fixture.Deliver();
     const auto psbt = fixture.Proposal();
     const auto proposal_tx = psbt.GetUnsignedTx();
@@ -631,7 +647,7 @@ void CheckProposalDeadline(IntegrationFixture& fixture, std::chrono::millisecond
 
     fixture.m_now = SenderService::Clock::time_point{} + intent.timeout + offset;
     pending.complete(std::move(pending.result));
-    fixture.m_queue->flush();
+    fixture.Flush();
 
     const auto view = *fixture.m_service->Snapshot(id);
     BOOST_REQUIRE(view.original);
@@ -800,7 +816,7 @@ BOOST_FIXTURE_TEST_CASE(sender_retry_signing_after_network_deadline, Integration
     auto intent = Intent();
     intent.timeout = std::chrono::seconds{10};
     const auto id = m_service->Start(intent);
-    m_queue->flush();
+    Flush();
     Deliver();
     const auto psbt = Proposal();
     const auto proposal_tx = psbt.GetUnsignedTx();
@@ -813,7 +829,7 @@ BOOST_FIXTURE_TEST_CASE(sender_retry_signing_after_network_deadline, Integration
 
     const auto unsigned_view = *m_service->Snapshot(id);
     BOOST_REQUIRE(unsigned_view.issue == PaymentIssue::Signing);
-    BOOST_CHECK_EQUAL(unsigned_view.diagnostic, "proposal signing incomplete");
+    BOOST_CHECK_EQUAL(unsigned_view.diagnostic, "Payjoin requires an unlocked wallet with local private keys");
     BOOST_REQUIRE(!unsigned_view.selected);
     BOOST_CHECK(unsigned_view.owns_inputs);
 
@@ -822,7 +838,7 @@ BOOST_FIXTURE_TEST_CASE(sender_retry_signing_after_network_deadline, Integration
         auto timer = std::move(m_timers.begin()->second);
         m_timers.erase(m_timers.begin());
         timer();
-        m_queue->flush();
+        Flush();
     }
     BOOST_CHECK(!m_service->Snapshot(id)->selected);
 
@@ -835,7 +851,7 @@ BOOST_FIXTURE_TEST_CASE(sender_retry_signing_after_network_deadline, Integration
 
     BOOST_REQUIRE(m_sender->Unlock(passphrase));
     m_service->RetrySigning(id);
-    m_queue->flush();
+    Flush();
 
     const auto view = *m_service->Snapshot(id);
     BOOST_REQUIRE_MESSAGE(view.node_accepted, view.diagnostic);
@@ -896,6 +912,7 @@ BOOST_FIXTURE_TEST_CASE(sender_proposal_input_total_above_max_money, Integration
 BOOST_FIXTURE_TEST_CASE(sender_signs_receiver_proposal_and_publishes, IntegrationFixture)
 {
     const auto id = m_service->Start(Intent());
+    m_node.chain->waitForNotifications();
     BOOST_CHECK(m_service->Snapshot(id)->phase == PaymentPhase::Queued);
 
     PaymentSnapshot prepared;
@@ -941,7 +958,7 @@ BOOST_FIXTURE_TEST_CASE(sender_signs_receiver_proposal_and_publishes, Integratio
         }
     };
 
-    m_queue->flush();
+    Flush();
     dispatch_hook.Reset();
 
     Deliver();
@@ -990,7 +1007,7 @@ BOOST_FIXTURE_TEST_CASE(sender_signs_receiver_proposal_and_publishes, Integratio
 BOOST_FIXTURE_TEST_CASE(sender_lost_initial_response_requires_attention, IntegrationFixture)
 {
     const auto id = m_service->Start(Intent());
-    m_queue->flush();
+    Flush();
 
     BOOST_REQUIRE_EQUAL(m_transport->m_pending.size(), 1);
     auto held = Forwarder().Capture();
@@ -998,7 +1015,7 @@ BOOST_FIXTURE_TEST_CASE(sender_lost_initial_response_requires_attention, Integra
     BOOST_REQUIRE(ReceiverOriginal());
 
     held.complete({Delivery::Uncertain, {}, "lost real response"});
-    m_queue->flush();
+    Flush();
 
     const auto view = *m_service->Snapshot(id);
     BOOST_CHECK(view.issue == PaymentIssue::Delivery);
@@ -1014,7 +1031,7 @@ BOOST_FIXTURE_TEST_CASE(sender_lost_initial_response_requires_attention, Integra
 BOOST_FIXTURE_TEST_CASE(sender_proposal_settlement_erases_only_original_stale_markers, IntegrationFixture)
 {
     const auto id = m_service->Start(Intent());
-    m_queue->flush();
+    Flush();
     Deliver();
     const auto proposal = Proposal();
     const auto original = m_service->Snapshot(id)->original;
@@ -1055,7 +1072,7 @@ BOOST_FIXTURE_TEST_CASE(sender_proposal_settlement_erases_only_original_stale_ma
 
     for (int i = 0; i < 2; ++i) {
         m_service->Refresh(id);
-        m_queue->flush();
+        Flush();
         CheckReleased(id);
         BOOST_CHECK(m_service->Snapshot(id)->settlement->kind == SpendKind::Selected);
         BOOST_CHECK(LockedMarker(receiver_input));
@@ -1068,7 +1085,7 @@ BOOST_FIXTURE_TEST_CASE(sender_proposal_settlement_erases_only_original_stale_ma
 BOOST_FIXTURE_TEST_CASE(sender_poll_trusts_persistent_memory_lock, IntegrationFixture)
 {
     const auto id = m_service->Start(Intent());
-    m_queue->flush();
+    Flush();
     Deliver();
     const auto original = m_service->Snapshot(id)->original;
     BOOST_REQUIRE(original);
@@ -1106,7 +1123,7 @@ BOOST_FIXTURE_TEST_CASE(sender_poll_trusts_persistent_memory_lock, IntegrationFi
 BOOST_FIXTURE_TEST_CASE(sender_poll_retry_uses_fresh_context_and_ignores_duplicate, IntegrationFixture)
 {
     const auto id = m_service->Start(Intent());
-    m_queue->flush();
+    Flush();
     Deliver();
 
     Tick();
@@ -1115,7 +1132,7 @@ BOOST_FIXTURE_TEST_CASE(sender_poll_retry_uses_fresh_context_and_ignores_duplica
     const auto old = m_transport->m_pending.front();
     m_transport->m_pending.pop_front();
     old.complete({Delivery::Uncertain, {}, "temporary polling failure", true});
-    m_queue->flush();
+    Flush();
 
     Tick();
     BOOST_REQUIRE_EQUAL(m_transport->m_pending.size(), 1);
@@ -1123,17 +1140,17 @@ BOOST_FIXTURE_TEST_CASE(sender_poll_retry_uses_fresh_context_and_ignores_duplica
     BOOST_CHECK(old.id != m_transport->m_pending.front().id);
 
     old.complete({Delivery::Response, {}, "duplicate"});
-    m_queue->flush();
+    Flush();
 
     BOOST_CHECK(m_service->Snapshot(id)->phase == PaymentPhase::Negotiating);
 
     auto real = Forwarder().Capture();
     real.complete(real.result);
-    m_queue->flush();
+    Flush();
 
     const auto journal = Journal(id);
     real.complete(real.result);
-    m_queue->flush();
+    Flush();
 
     BOOST_CHECK(Journal(id) == journal);
     BOOST_CHECK(!m_service->Snapshot(id)->issue);
@@ -1142,7 +1159,7 @@ BOOST_FIXTURE_TEST_CASE(sender_poll_retry_uses_fresh_context_and_ignores_duplica
 BOOST_FIXTURE_TEST_CASE(sender_manual_unlock_blocks_publication_without_releasing_ownership, IntegrationFixture)
 {
     const auto id = m_service->Start(Intent());
-    m_queue->flush();
+    Flush();
     Deliver();
     const auto view = *m_service->Snapshot(id);
     {
@@ -1156,7 +1173,7 @@ BOOST_FIXTURE_TEST_CASE(sender_manual_unlock_blocks_publication_without_releasin
     BOOST_CHECK(!m_service->Snapshot(id)->selected);
 
     const auto other = m_service->Start(Intent());
-    m_queue->flush();
+    Flush();
     BOOST_CHECK(!m_service->Snapshot(other)->selected);
 }
 
@@ -1173,7 +1190,7 @@ BOOST_FIXTURE_TEST_CASE(sender_queued_proposal_is_usable_without_cancellation, I
 BOOST_FIXTURE_TEST_CASE(sender_mempool_fallback_ignores_late_proposal, IntegrationFixture)
 {
     const auto id = m_service->Start(Intent());
-    m_queue->flush();
+    Flush();
     Deliver();
     Proposal();
 
@@ -1192,7 +1209,7 @@ BOOST_FIXTURE_TEST_CASE(sender_mempool_fallback_ignores_late_proposal, Integrati
     }
 
     m_service->PublishFallback(id);
-    m_queue->flush();
+    Flush();
 
     const auto published = *m_service->Snapshot(id);
     BOOST_REQUIRE(published.selected);
@@ -1205,7 +1222,7 @@ BOOST_FIXTURE_TEST_CASE(sender_mempool_fallback_ignores_late_proposal, Integrati
     const auto attempts = m_transport->m_attempts;
 
     pending.complete(std::move(pending.result));
-    m_queue->flush();
+    Flush();
 
     const auto after = *m_service->Snapshot(id);
     BOOST_REQUIRE(after.selected);
@@ -1223,7 +1240,7 @@ BOOST_FIXTURE_TEST_CASE(sender_mempool_fallback_ignores_late_proposal, Integrati
 BOOST_FIXTURE_TEST_CASE(sender_proposal_publication_wins_before_fallback, IntegrationFixture)
 {
     const auto id = m_service->Start(Intent());
-    m_queue->flush();
+    Flush();
     Deliver();
     Proposal();
 
@@ -1231,7 +1248,7 @@ BOOST_FIXTURE_TEST_CASE(sender_proposal_publication_wins_before_fallback, Integr
     auto pending = Forwarder().Capture();
     pending.complete(pending.result);
     m_service->PublishFallback(id);
-    m_queue->flush();
+    Flush();
 
     const auto view = *m_service->Snapshot(id);
     BOOST_REQUIRE_MESSAGE(view.node_accepted, view.diagnostic);
@@ -1246,7 +1263,7 @@ BOOST_FIXTURE_TEST_CASE(sender_signing_failure_allows_explicit_choice_or_retry, 
     BOOST_REQUIRE(m_sender->Unlock(passphrase));
 
     const auto id = m_service->Start(Intent());
-    m_queue->flush();
+    Flush();
 
     BOOST_REQUIRE_MESSAGE(m_service->Snapshot(id)->transport_accepted, m_service->Snapshot(id)->diagnostic);
     Deliver();
@@ -1261,7 +1278,7 @@ BOOST_FIXTURE_TEST_CASE(sender_signing_failure_allows_explicit_choice_or_retry, 
     BOOST_CHECK(m_service->Snapshot(id)->owns_inputs);
 
     m_service->RetrySigning(id);
-    m_queue->flush();
+    Flush();
 
     BOOST_CHECK(m_service->Snapshot(id)->issue == PaymentIssue::Signing);
     BOOST_CHECK(!m_service->Snapshot(id)->selected);
@@ -1270,7 +1287,7 @@ BOOST_FIXTURE_TEST_CASE(sender_signing_failure_allows_explicit_choice_or_retry, 
     m_now += std::chrono::hours{1};
 
     m_service->RetrySigning(id);
-    m_queue->flush();
+    Flush();
 
     BOOST_REQUIRE_MESSAGE(m_service->Snapshot(id)->node_accepted, m_service->Snapshot(id)->diagnostic);
     BOOST_CHECK(m_service->Snapshot(id)->selection_saved);
@@ -1279,7 +1296,7 @@ BOOST_FIXTURE_TEST_CASE(sender_signing_failure_allows_explicit_choice_or_retry, 
 BOOST_FIXTURE_TEST_CASE(sender_does_not_sign_extra_wallet_input, IntegrationFixture)
 {
     const auto id = m_service->Start(Intent());
-    m_queue->flush();
+    Flush();
 
     const auto view = *m_service->Snapshot(id);
     BOOST_REQUIRE(view.original);
@@ -1308,22 +1325,24 @@ BOOST_FIXTURE_TEST_CASE(sender_does_not_sign_extra_wallet_input, IntegrationFixt
 
     const auto journal = Journal(id);
     m_service->Cancel(id);
-    m_queue->flush();
+    Flush();
 
     BOOST_CHECK(m_service->Snapshot(id)->fallback_available);
 
-    m_service->RetrySigning(id);
-    m_queue->flush();
+    auto signing_future = m_service->Execute(id, SenderCommand::RetrySigning);
+    Flush();
 
-    BOOST_CHECK(m_service->Snapshot(id)->command_refusal == CommandRefusal::InvalidState);
+    const auto signing_result = signing_future.get();
+    BOOST_CHECK(signing_result.refusal == CommandRefusal::InvalidState);
 
-    m_service->PublishFallback(id);
-    m_queue->flush();
+    auto fallback_future = m_service->Execute(id, SenderCommand::Fallback);
+    Flush();
 
     BOOST_REQUIRE(m_service->Snapshot(id)->selected);
     BOOST_CHECK(m_service->Snapshot(id)->selected->GetWitnessHash() == view.original->GetWitnessHash());
     BOOST_CHECK(m_service->Snapshot(id)->node_accepted);
-    BOOST_CHECK(!m_service->Snapshot(id)->command_refusal);
+    const auto fallback_result = fallback_future.get();
+    BOOST_CHECK(!fallback_result.refusal);
 
     BOOST_CHECK(Journal(id) == journal);
 }
@@ -1331,7 +1350,7 @@ BOOST_FIXTURE_TEST_CASE(sender_does_not_sign_extra_wallet_input, IntegrationFixt
 BOOST_FIXTURE_TEST_CASE(sender_publication_retry_and_confirmed_cleanup, IntegrationFixture)
 {
     const auto id = m_service->Start(Intent());
-    m_queue->flush();
+    Flush();
     Deliver();
     Proposal();
 
@@ -1346,29 +1365,31 @@ BOOST_FIXTURE_TEST_CASE(sender_publication_retry_and_confirmed_cleanup, Integrat
     BOOST_CHECK(!rejected.node_accepted);
     BOOST_CHECK(rejected.selected);
 
-    m_service->PublishFallback(id);
-    m_queue->flush();
+    auto fallback_future = m_service->Execute(id, SenderCommand::Fallback);
+    Flush();
 
     BOOST_CHECK(m_service->Snapshot(id)->selected->GetWitnessHash() == rejected.selected->GetWitnessHash());
-    BOOST_CHECK(m_service->Snapshot(id)->command_refusal == CommandRefusal::Selected);
+    const auto fallback_result = fallback_future.get();
+    BOOST_CHECK(fallback_result.refusal == CommandRefusal::Selected);
 
     m_sender->m_max_tx_fee = max_fee;
-    m_service->RetryPublication(id);
-    m_queue->flush();
+    auto publication_future = m_service->Execute(id, SenderCommand::RetryPublication);
+    Flush();
 
     BOOST_REQUIRE_MESSAGE(m_service->Snapshot(id)->node_accepted, m_service->Snapshot(id)->diagnostic);
-    BOOST_CHECK(!m_service->Snapshot(id)->command_refusal);
+    const auto publication_result = publication_future.get();
+    BOOST_CHECK(!publication_result.refusal);
 
     const auto block = Confirm(rejected.selected);
 
     m_service->Refresh(id);
-    m_queue->flush();
+    Flush();
 
     BOOST_CHECK(m_service->Snapshot(id)->phase == PaymentPhase::Confirmed);
     BOOST_CHECK(!m_service->Snapshot(id)->owns_inputs);
 
     m_service->RetryPublication(id);
-    m_queue->flush();
+    Flush();
     {
         LOCK(m_sender->cs_wallet);
         const auto* confirmed = m_sender->GetWalletTx(rejected.selected->GetHash())->state<TxStateConfirmed>();
@@ -1379,7 +1400,7 @@ BOOST_FIXTURE_TEST_CASE(sender_publication_retry_and_confirmed_cleanup, Integrat
     Disconnect(block);
     for (int i = 0; i < 2; ++i) {
         m_service->Refresh(id);
-        m_queue->flush();
+        Flush();
 
         const auto view = *m_service->Snapshot(id);
         BOOST_CHECK(!view.settlement);
@@ -1388,16 +1409,17 @@ BOOST_FIXTURE_TEST_CASE(sender_publication_retry_and_confirmed_cleanup, Integrat
         BOOST_CHECK(view.selected_presence == TransactionPresence::Inactive);
     }
 
-    m_service->RetryPublication(id);
-    m_queue->flush();
+    auto settled_publication_future = m_service->Execute(id, SenderCommand::RetryPublication);
+    Flush();
 
-    BOOST_CHECK(m_service->Snapshot(id)->command_refusal == CommandRefusal::Settled);
+    const auto settled_publication_result = settled_publication_future.get();
+    BOOST_CHECK(settled_publication_result.refusal == CommandRefusal::Settled);
 }
 
 BOOST_FIXTURE_TEST_CASE(sender_selection_write_failure_forbids_publication, IntegrationFixture)
 {
     const auto id = m_service->Start(Intent());
-    m_queue->flush();
+    Flush();
     Deliver();
     Proposal();
 
@@ -1416,7 +1438,7 @@ BOOST_FIXTURE_TEST_CASE(sender_selection_write_failure_forbids_publication, Inte
     BOOST_CHECK(view.owns_inputs);
 
     m_service->PublishFallback(id);
-    m_queue->flush();
+    Flush();
 
     BOOST_CHECK(m_service->Snapshot(id)->selected->GetWitnessHash() == view.selected->GetWitnessHash());
 
@@ -1427,7 +1449,7 @@ BOOST_FIXTURE_TEST_CASE(sender_selection_write_failure_forbids_publication, Inte
 BOOST_FIXTURE_TEST_CASE(sender_requires_persistent_lock_and_excludes_owned_coins, IntegrationFixture)
 {
     const auto first = m_service->Start(Intent());
-    m_queue->flush();
+    Flush();
 
     const auto coin = m_service->Snapshot(first)->original->vin.front().prevout;
     {
@@ -1446,7 +1468,7 @@ BOOST_FIXTURE_TEST_CASE(sender_requires_persistent_lock_and_excludes_owned_coins
     }
 
     const auto second = m_service->Start(Intent());
-    m_queue->flush();
+    Flush();
 
     BOOST_REQUIRE_MESSAGE(m_service->Snapshot(second)->transport_accepted, m_service->Snapshot(second)->diagnostic);
     for (const auto& input : m_service->Snapshot(second)->original->vin) {
@@ -1462,7 +1484,7 @@ BOOST_FIXTURE_TEST_CASE(sender_requires_persistent_lock_and_excludes_owned_coins
 BOOST_FIXTURE_TEST_CASE(sender_original_settles_after_proposal_selection, IntegrationFixture)
 {
     const auto id = m_service->Start(Intent());
-    m_queue->flush();
+    Flush();
 
     const auto original = m_service->Snapshot(id)->original;
     Deliver();
@@ -1478,7 +1500,7 @@ BOOST_FIXTURE_TEST_CASE(sender_original_settles_after_proposal_selection, Integr
 
     Confirm(original);
     m_service->Refresh(id);
-    m_queue->flush();
+    Flush();
 
     const auto view = *m_service->Snapshot(id);
     BOOST_CHECK(view.phase == PaymentPhase::Confirmed);
@@ -1491,7 +1513,7 @@ BOOST_FIXTURE_TEST_CASE(sender_original_settles_after_proposal_selection, Integr
 BOOST_FIXTURE_TEST_CASE(sender_wallet_change_before_signing_wins, IntegrationFixture)
 {
     const auto id = m_service->Start(Intent());
-    m_queue->flush();
+    Flush();
     Deliver();
     Proposal();
 
@@ -1506,7 +1528,7 @@ BOOST_FIXTURE_TEST_CASE(sender_wallet_change_before_signing_wins, IntegrationFix
         auto start = started.get_future();
         run = std::async(std::launch::async, [&] {
             started.set_value();
-            m_queue->flush();
+            Flush();
         });
         start.wait();
         BOOST_REQUIRE(m_sender->UnlockCoin(m_service->Snapshot(id)->original->vin[0].prevout));
@@ -1515,10 +1537,11 @@ BOOST_FIXTURE_TEST_CASE(sender_wallet_change_before_signing_wins, IntegrationFix
     run.get();
     BOOST_CHECK(m_service->Snapshot(id)->issue == PaymentIssue::Reservation);
 
-    m_service->RetrySigning(id);
-    m_queue->flush();
+    auto signing_future = m_service->Execute(id, SenderCommand::RetrySigning);
+    Flush();
 
-    BOOST_CHECK(m_service->Snapshot(id)->command_refusal == CommandRefusal::InputsChanged);
+    const auto signing_result = signing_future.get();
+    BOOST_CHECK(signing_result.refusal == CommandRefusal::InputsChanged);
     BOOST_CHECK(!m_service->Snapshot(id)->selected);
 }
 
@@ -1541,7 +1564,7 @@ BOOST_FIXTURE_TEST_CASE(sender_total_fee_policy_boundary, IntegrationFixture)
     }
 
     const auto id = m_service->Start(Intent());
-    m_queue->flush();
+    Flush();
 
     BOOST_REQUIRE(m_service->Snapshot(id)->transport_accepted);
     Deliver();
@@ -1556,7 +1579,7 @@ BOOST_FIXTURE_TEST_CASE(sender_total_fee_policy_boundary, IntegrationFixture)
     BOOST_REQUIRE(fee > 0);
 
     m_service->Cancel(id);
-    m_queue->flush();
+    Flush();
 
     for (const CAmount maximum : {fee - 1, fee}) {
         BOOST_TEST_CONTEXT("max total fee=" << maximum)
@@ -1565,7 +1588,7 @@ BOOST_FIXTURE_TEST_CASE(sender_total_fee_policy_boundary, IntegrationFixture)
             auto intent = Intent();
             intent.max_fee = maximum;
             const auto payment = m_service->Start(intent);
-            m_queue->flush();
+            Flush();
 
             BOOST_REQUIRE_MESSAGE(m_service->Snapshot(payment)->transport_accepted, m_service->Snapshot(payment)->diagnostic);
             Deliver();
@@ -1591,7 +1614,7 @@ BOOST_FIXTURE_TEST_CASE(sender_total_fee_policy_boundary, IntegrationFixture)
             }
 
             m_service->Cancel(payment);
-            m_queue->flush();
+            Flush();
         }
     }
 }
@@ -1599,26 +1622,29 @@ BOOST_FIXTURE_TEST_CASE(sender_total_fee_policy_boundary, IntegrationFixture)
 BOOST_FIXTURE_TEST_CASE(sender_explicit_commands_replace_refusal, IntegrationFixture)
 {
     const auto id = m_service->Start(Intent());
-    m_queue->flush();
+    Flush();
 
-    m_service->RetryPublication(id);
-    m_queue->flush();
+    auto publication_future = m_service->Execute(id, SenderCommand::RetryPublication);
+    Flush();
 
-    BOOST_CHECK(m_service->Snapshot(id)->command_refusal == CommandRefusal::InvalidState);
+    const auto publication_result = publication_future.get();
+    BOOST_CHECK(publication_result.refusal == CommandRefusal::InvalidState);
 
     Deliver();
-    BOOST_CHECK(m_service->Snapshot(id)->command_refusal == CommandRefusal::InvalidState);
+    BOOST_CHECK(publication_result.refusal == CommandRefusal::InvalidState);
 
-    m_service->Refresh(id);
-    m_queue->flush();
+    auto refresh_future = m_service->Execute(id, SenderCommand::Refresh);
+    Flush();
 
-    BOOST_CHECK(!m_service->Snapshot(id)->command_refusal);
+    const auto refresh_result = refresh_future.get();
+    BOOST_CHECK(!refresh_result.refusal);
 
     m_service->RetryPublication(id);
-    m_service->Cancel(id);
-    m_queue->flush();
+    auto cancel_future = m_service->Execute(id, SenderCommand::Cancel);
+    Flush();
 
-    BOOST_CHECK(!m_service->Snapshot(id)->command_refusal);
+    const auto cancel_result = cancel_future.get();
+    BOOST_CHECK(!cancel_result.refusal);
     BOOST_CHECK(m_service->Snapshot(id)->phase == PaymentPhase::Cancelled);
 }
 
@@ -1630,7 +1656,7 @@ BOOST_FIXTURE_TEST_CASE(sender_services_exclusively_own_their_transports, Integr
 
     const auto first = m_service->Start(Intent());
     const auto second = other->Start(Intent());
-    m_queue->flush();
+    Flush();
 
     BOOST_REQUIRE_EQUAL(m_transport->m_pending.size(), 1);
     BOOST_REQUIRE_EQUAL(other_transport->m_pending.size(), 1);
@@ -1642,7 +1668,7 @@ BOOST_FIXTURE_TEST_CASE(sender_services_exclusively_own_their_transports, Integr
 
     auto request = other_transport->Capture();
     request.complete(request.result);
-    m_queue->flush();
+    Flush();
     Tick();
     BOOST_CHECK_EQUAL(other_transport->m_pending.size(), 1);
     BOOST_CHECK(other->Snapshot(second)->phase == PaymentPhase::Negotiating);
@@ -1650,7 +1676,7 @@ BOOST_FIXTURE_TEST_CASE(sender_services_exclusively_own_their_transports, Integr
 
     auto poll = other_transport->Capture();
     poll.complete(poll.result);
-    m_queue->flush();
+    Flush();
 
     other_transport->m_acceptance = SubmitResult::Busy;
     Tick();
@@ -1668,7 +1694,7 @@ BOOST_FIXTURE_TEST_CASE(sender_services_exclusively_own_their_transports, Integr
 BOOST_FIXTURE_TEST_CASE(sender_poll_checks_only_original_reservations, IntegrationFixture)
 {
     const auto id = m_service->Start(Intent());
-    m_queue->flush();
+    Flush();
     Deliver();
     const auto original = m_service->Snapshot(id)->original;
     BOOST_REQUIRE(original);
@@ -1748,19 +1774,19 @@ BOOST_AUTO_TEST_CASE(http_transport_tls_proxy_deadline_and_cancellation)
 BOOST_FIXTURE_TEST_CASE(sender_real_network_explicit_fallback, IntegrationFixture)
 {
     const auto id = m_service->Start(Intent());
-    m_queue->flush();
+    Flush();
     Deliver();
     BOOST_REQUIRE(ReceiverOriginal());
 
     const auto original = m_service->Snapshot(id)->original;
 
     m_service->Cancel(id);
-    m_queue->flush();
+    Flush();
 
     BOOST_CHECK(!m_service->Snapshot(id)->selected);
 
     m_service->PublishFallback(id);
-    m_queue->flush();
+    Flush();
 
     const auto view = *m_service->Snapshot(id);
     BOOST_REQUIRE_MESSAGE(view.node_accepted, view.diagnostic);
@@ -1790,14 +1816,14 @@ BOOST_AUTO_TEST_CASE(forwarding_transport_expired_held_request_never_reaches_htt
 BOOST_FIXTURE_TEST_CASE(sender_poll_retryable_not_sent_and_terminal_delivery, IntegrationFixture)
 {
     const auto id = m_service->Start(Intent());
-    m_queue->flush();
+    Flush();
     Deliver();
 
     Tick();
     auto pending = std::move(m_transport->m_pending.front());
     m_transport->m_pending.pop_front();
     pending.complete({Delivery::NotSent, {}, "temporary pre-dispatch failure", true});
-    m_queue->flush();
+    Flush();
 
     Tick();
     BOOST_REQUIRE_EQUAL(m_transport->m_pending.size(), 1);
@@ -1806,7 +1832,7 @@ BOOST_FIXTURE_TEST_CASE(sender_poll_retryable_not_sent_and_terminal_delivery, In
     auto terminal = std::move(m_transport->m_pending.front());
     m_transport->m_pending.pop_front();
     terminal.complete({Delivery::NotSent, {}, "permanent transport configuration failure", false});
-    m_queue->flush();
+    Flush();
 
     BOOST_CHECK(m_service->Snapshot(id)->issue == PaymentIssue::Delivery);
 
@@ -1822,7 +1848,7 @@ BOOST_FIXTURE_TEST_CASE(sender_poll_retryable_not_sent_and_terminal_delivery, In
     const auto attempts = m_transport->m_attempts;
     for (int i = 0; i < 2; ++i) {
         m_service->Refresh(id);
-        m_queue->flush();
+        Flush();
 
         const auto view = *m_service->Snapshot(id);
         BOOST_CHECK(view.phase == PaymentPhase::Attention);
@@ -1833,7 +1859,7 @@ BOOST_FIXTURE_TEST_CASE(sender_poll_retryable_not_sent_and_terminal_delivery, In
     }
 
     m_service->PublishFallback(id);
-    m_queue->flush();
+    Flush();
 
     const auto published = *m_service->Snapshot(id);
     BOOST_REQUIRE(published.selected);
@@ -1855,7 +1881,7 @@ BOOST_FIXTURE_TEST_CASE(sender_poll_retryable_not_sent_and_terminal_delivery, In
 BOOST_FIXTURE_TEST_CASE(sender_busy_poll_preserves_previous_disclosure, IntegrationFixture)
 {
     const auto id = m_service->Start(Intent());
-    m_queue->flush();
+    Flush();
     Deliver();
     BOOST_REQUIRE(m_service->Snapshot(id)->possibly_exposed);
     BOOST_REQUIRE(m_service->Snapshot(id)->disclosure_saved);
@@ -1877,7 +1903,7 @@ BOOST_FIXTURE_TEST_CASE(sender_busy_poll_preserves_previous_disclosure, Integrat
 BOOST_FIXTURE_TEST_CASE(sender_not_sent_poll_preserves_previous_disclosure, IntegrationFixture)
 {
     const auto id = m_service->Start(Intent());
-    m_queue->flush();
+    Flush();
     Deliver();
     BOOST_REQUIRE(m_service->Snapshot(id)->possibly_exposed);
     BOOST_REQUIRE(ReadStoredPayment(id).exposed);
@@ -1885,7 +1911,7 @@ BOOST_FIXTURE_TEST_CASE(sender_not_sent_poll_preserves_previous_disclosure, Inte
     Tick();
     BOOST_REQUIRE_EQUAL(m_transport->m_pending.size(), 1);
     m_transport->m_pending.front().complete({Delivery::NotSent, {}, "local URL rejected", false});
-    m_queue->flush();
+    Flush();
 
     const auto failed = *m_service->Snapshot(id);
     BOOST_CHECK(failed.issue == PaymentIssue::Delivery);
@@ -1895,7 +1921,7 @@ BOOST_FIXTURE_TEST_CASE(sender_not_sent_poll_preserves_previous_disclosure, Inte
     BOOST_CHECK(failed.owns_inputs);
 
     m_service->Cancel(id);
-    m_queue->flush();
+    Flush();
 
     const auto cancelled = *m_service->Snapshot(id);
     BOOST_CHECK(cancelled.phase == PaymentPhase::Cancelled);
