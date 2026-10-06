@@ -8,11 +8,13 @@
 #include <common/types.h>
 #include <consensus/amount.h>
 #include <interfaces/chain.h>
+#include <interfaces/handler.h>
 #include <key_io.h>
 #include <logging.h>
 #include <node/types.h>
 #include <payjoin/client.h>
 #include <payjoin/transport.h>
+#include <policy/feerate.h>
 #include <primitives/transaction.h>
 #include <psbt.h>
 #include <random.h>
@@ -26,6 +28,7 @@
 #include <util/ui_change_type.h>
 #include <wallet/coincontrol.h>
 #include <wallet/db.h>
+#include <wallet/fees.h>
 #include <wallet/spend.h>
 #include <wallet/transaction.h>
 #include <wallet/types.h>
@@ -39,6 +42,7 @@
 #include <cstdint>
 #include <exception>
 #include <functional>
+#include <future>
 #include <map>
 #include <memory>
 #include <new>
@@ -92,6 +96,7 @@ struct FallbackPolicyFacts {
 }
 
 constexpr auto PAYJOIN_LOG_CATEGORY{BCLog::WALLETDB};
+
 auto RecordKey(const uint256& id) { return std::pair{std::string{"payjoin/payment"}, id}; }
 
 auto JournalKey(const uint256& id) { return std::pair{std::string{"payjoin/journal"}, id}; }
@@ -189,6 +194,7 @@ util::Expected<PayjoinUriInfo, std::string> ValidatePaymentIntent(const PaymentI
 struct SenderService::State : std::enable_shared_from_this<State> {
     struct Payment {
         PaymentIntent intent;
+        PaymentRequest requested;
         uint256 id;
         PaymentPhase phase{PaymentPhase::Queued};
         CTransactionRef original;
@@ -216,8 +222,6 @@ struct SenderService::State : std::enable_shared_from_this<State> {
         std::optional<SpendObservation> observed_spend;
         std::optional<SpendObservation> settlement;
 
-        std::optional<CommandRefusal> command_refusal;
-
         std::optional<SenderSession> session;
         Clock::time_point deadline;
 
@@ -236,21 +240,48 @@ struct SenderService::State : std::enable_shared_from_this<State> {
 
     CWallet& m_wallet;
     SerialTaskRunner& m_executor;
+    interfaces::Chain& m_chain;
     std::unique_ptr<SenderTransport> m_transport;
+    TransportFactory m_transport_factory;
     Now m_now;
     Schedule m_schedule;
+    NetworkCheck m_network_check;
+    std::unique_ptr<interfaces::Handler> m_notifications;
     Mutex m_stop_mutex;
     Mutex m_gate;
-    bool m_stopped GUARDED_BY(m_gate){false};
     std::map<uint256, Payment> m_payments GUARDED_BY(m_gate);
+    std::map<std::string, uint256> m_request_ids GUARDED_BY(m_gate);
     uint64_t m_next_request GUARDED_BY(m_gate){0};
+
+    enum class Lifecycle {
+        Running,
+        Closing,
+        Stopped,
+    };
+
+    struct Operation {
+        std::optional<uint256> id;
+        std::promise<ManagerResult> promise;
+
+        explicit Operation(std::optional<uint256> payment_id) : id{payment_id} {}
+    };
+
+    mutable Mutex m_operations_mutex;
+    Lifecycle m_lifecycle GUARDED_BY(m_operations_mutex){Lifecycle::Running};
+    std::set<std::shared_ptr<Operation>> m_operations GUARDED_BY(m_operations_mutex);
+    bool m_observation_pending GUARDED_BY(m_operations_mutex){false};
+    std::shared_ptr<const std::vector<PaymentView>> m_archive GUARDED_BY(m_operations_mutex);
 
     mutable Mutex m_views_mutex;
     std::map<uint256, PaymentSnapshot> m_views GUARDED_BY(m_views_mutex);
 
     explicit State(CWallet& wallet, SerialTaskRunner& executor,
                    std::unique_ptr<SenderTransport> transport, Now now, Schedule schedule)
-        : m_wallet{wallet}, m_executor{executor}, m_transport{std::move(transport)}, m_now{std::move(now)}, m_schedule{std::move(schedule)} {}
+        : m_wallet{wallet}, m_executor{executor}, m_chain{wallet.chain()}, m_transport{std::move(transport)}, m_now{std::move(now)}, m_schedule{std::move(schedule)} {}
+
+    explicit State(CWallet& wallet, SerialTaskRunner& executor,
+                   TransportFactory transport, Now now, Schedule schedule, NetworkCheck network_check)
+        : m_wallet{wallet}, m_executor{executor}, m_chain{wallet.chain()}, m_transport_factory{std::move(transport)}, m_now{std::move(now)}, m_schedule{std::move(schedule)}, m_network_check{std::move(network_check)} {}
 
     static Record StoredRecord(const Payment& payment)
     {
@@ -290,11 +321,18 @@ struct SenderService::State : std::enable_shared_from_this<State> {
         view.fallback_available = !FallbackRefusal(payment);
         view.issue = payment.issue;
         view.diagnostic = payment.diagnostic;
-        view.command_refusal = payment.command_refusal;
         view.original_presence = payment.original_presence;
         view.selected_presence = payment.selected_presence;
         view.observed_spend = payment.observed_spend;
         view.settlement = payment.settlement;
+        view.deadline = payment.deadline;
+        view.cancel_available = !payment.storage.uncertain && !payment.selected && !payment.settlement &&
+                                payment.phase != PaymentPhase::Stopped && payment.phase != PaymentPhase::Cancelled;
+        view.signing_available = payment.session && payment.session->OutcomeKind() == SenderOutcomeKind::Proposal &&
+                                 !payment.storage.uncertain && !payment.storage.released && !payment.selected && !payment.settlement &&
+                                 payment.phase != PaymentPhase::Cancelled && payment.phase != PaymentPhase::Stopped;
+        view.publication_retry_available = payment.selected && payment.storage.selection_saved && payment.wallet_recorded &&
+                                           !payment.storage.uncertain && !payment.storage.released && !payment.settlement;
         return view;
     }
 
@@ -304,11 +342,12 @@ struct SenderService::State : std::enable_shared_from_this<State> {
         m_views[payment.id] = BuildSnapshot(payment);
     }
 
-    void Refuse(Payment& payment, CommandRefusal reason) EXCLUSIVE_LOCKS_REQUIRED(!m_views_mutex)
-    {
-        payment.command_refusal = reason;
-        Update(payment);
-    }
+    struct CommandOutcome {
+        CommandStatus status;
+        std::optional<CommandRefusal> refusal{};
+    };
+
+    static CommandOutcome Refuse(CommandRefusal reason) { return {CommandStatus::Refused, reason}; }
 
     void Fail(Payment& payment, PaymentIssue issue, std::string diagnostic) EXCLUSIVE_LOCKS_REQUIRED(!m_views_mutex)
     {
@@ -325,26 +364,276 @@ struct SenderService::State : std::enable_shared_from_this<State> {
         Fail(payment, PaymentIssue::Storage, std::move(diagnostic));
     }
 
-    void Queue(const uint256& id, std::function<void(State&, Payment&)> fn)
+    bool Running() const EXCLUSIVE_LOCKS_REQUIRED(!m_operations_mutex)
     {
-        m_executor.insert([weak = weak_from_this(), id, fn = std::move(fn)] {
+        LOCK(m_operations_mutex);
+        return m_lifecycle == Lifecycle::Running;
+    }
+
+    void Post(std::function<void(State&)> work) EXCLUSIVE_LOCKS_REQUIRED(!m_operations_mutex)
+    {
+        LOCK(m_operations_mutex);
+        if (m_lifecycle != Lifecycle::Running) return;
+
+        m_executor.insert([weak = weak_from_this(), work = std::move(work)] {
             if (auto state = weak.lock()) {
                 LOCK(state->m_gate);
-                if (state->m_stopped) return;
+                if (!state->Running()) return;
 
-                auto found = state->m_payments.find(id);
-                if (found == state->m_payments.end()) return;
-
-                auto& payment = found->second;
-                try {
-                    fn(*state, payment);
-                } catch (const std::bad_alloc&) {
-                    throw;
-                } catch (const std::exception&) {
-                    state->StorageFailure(payment, "wallet operation failed; effects require reconciliation");
-                }
+                work(*state);
             }
         });
+    }
+
+    void Queue(const uint256& id, std::function<void(State&, Payment&)> fn) EXCLUSIVE_LOCKS_REQUIRED(!m_operations_mutex)
+    {
+        Post([id, fn = std::move(fn)](State& state) EXCLUSIVE_LOCKS_REQUIRED(state.m_gate) {
+            const auto found = state.m_payments.find(id);
+            if (found == state.m_payments.end()) return;
+
+            try {
+                fn(state, found->second);
+            } catch (const std::bad_alloc&) {
+                throw;
+            } catch (const std::exception&) {
+                state.StorageFailure(found->second, "wallet operation failed; effects require reconciliation");
+            }
+        });
+    }
+
+    static PaymentView View(const Payment& payment)
+    {
+        return {BuildSnapshot(payment), payment.requested, payment.intent};
+    }
+
+    static ManagerResult StoppedResult(const std::vector<PaymentView>& archive, std::optional<uint256> id)
+    {
+        ManagerResult result{CommandStatus::Stopped};
+        for (const auto& view : archive) {
+            if (!id || view.payment.id == *id) result.payments.push_back(view);
+        }
+        return result;
+    }
+
+    std::pair<std::shared_ptr<Operation>, std::future<ManagerResult>> Register(std::optional<uint256> id)
+        EXCLUSIVE_LOCKS_REQUIRED(!m_operations_mutex)
+    {
+        auto operation = std::make_shared<Operation>(id);
+        auto future = operation->promise.get_future();
+
+        LOCK(m_operations_mutex);
+        if (m_lifecycle == Lifecycle::Stopped) {
+            operation->promise.set_value(StoppedResult(*m_archive, id));
+            return {nullptr, std::move(future)};
+        }
+
+        m_operations.insert(operation);
+        return {std::move(operation), std::move(future)};
+    }
+
+    void Finish(const std::shared_ptr<Operation>& operation, ManagerResult result, bool running_only = false) EXCLUSIVE_LOCKS_REQUIRED(!m_operations_mutex)
+    {
+        LOCK(m_operations_mutex);
+        if (running_only && m_lifecycle != Lifecycle::Running) return;
+        if (!m_operations.contains(operation)) return;
+
+        operation->promise.set_value(std::move(result));
+        m_operations.erase(operation);
+    }
+
+    void RunOperation(const std::shared_ptr<Operation>& operation, std::function<ManagerResult(State&)> work) EXCLUSIVE_LOCKS_REQUIRED(!m_operations_mutex)
+    {
+        Post([operation, work = std::move(work)](State& state) EXCLUSIVE_LOCKS_REQUIRED(state.m_gate) {
+            ManagerResult result;
+            try {
+                result = work(state);
+            } catch (const std::bad_alloc&) {
+                throw;
+            } catch (const std::exception&) {
+                result = {CommandStatus::Failed, {}, false, RequestError::Internal, "Payjoin command failed"};
+                const auto found = operation->id ? state.m_payments.find(*operation->id) : state.m_payments.end();
+                if (found != state.m_payments.end()) result.payments.push_back(View(found->second));
+            }
+
+            state.Finish(operation, std::move(result));
+        });
+    }
+
+    uint256 RegisterPayment(PaymentIntent intent, PaymentRequest requested) EXCLUSIVE_LOCKS_REQUIRED(m_gate, !m_views_mutex, !m_operations_mutex)
+    {
+        AssertLockHeld(m_gate);
+        const auto id = GetRandHash();
+
+        Payment payment;
+        payment.intent = std::move(intent);
+        payment.requested = std::move(requested);
+        payment.id = id;
+        payment.deadline = m_now() + std::clamp(payment.intent.timeout, std::chrono::milliseconds::zero(), std::chrono::milliseconds{std::chrono::hours{24}});
+
+        auto [it, inserted] = m_payments.emplace(id, std::move(payment));
+        if (it->second.requested.request_id) m_request_ids.emplace(*it->second.requested.request_id, id);
+        Update(it->second);
+
+        try {
+            m_chain.requestNotificationBarrier([weak = weak_from_this(), id] {
+                if (auto state = weak.lock()) {
+                    state->Queue(id, [](State& queued_state, Payment& queued_payment) { queued_state.Prepare(queued_payment); });
+                }
+            });
+        } catch (const std::bad_alloc&) {
+            throw;
+        } catch (const std::exception&) {
+            Fail(it->second, PaymentIssue::Preparation, "Payjoin preparation barrier failed");
+        }
+        return id;
+    }
+
+    static ManagerResult Rejected(RequestError error, std::string diagnostic)
+    {
+        return {CommandStatus::Refused, {}, false, error, std::move(diagnostic)};
+    }
+
+    ManagerResult Accept(PaymentRequest request) EXCLUSIVE_LOCKS_REQUIRED(m_gate, !m_views_mutex, !m_operations_mutex)
+    {
+        AssertLockHeld(m_gate);
+        if (request.request_id) {
+            const auto found = m_request_ids.find(*request.request_id);
+            if (found != m_request_ids.end()) {
+                const auto& payment = m_payments.at(found->second);
+                if (!(payment.requested == request)) return Rejected(RequestError::IdempotencyConflict, "request_id was accepted with different parameters");
+                return {CommandStatus::Completed, {View(payment)}, true};
+            }
+            if (request.request_id->empty() || request.request_id->size() > 128 || request.request_id->find('\0') != std::string::npos) {
+                return Rejected(RequestError::InvalidParameter, "request_id must contain 1 to 128 bytes without NUL");
+            }
+        }
+        if (request.timeout_seconds && (*request.timeout_seconds < 1 || *request.timeout_seconds > 86400)) {
+            return Rejected(RequestError::InvalidParameter, "timeout must be an integer from 1 to 86400 seconds");
+        }
+
+        const auto uri = ParsePayjoinUri(request.uri);
+        if (!uri) return Rejected(RequestError::InvalidParameter, uri.error().message);
+        if (!request.amount && !uri->amount_sats) return Rejected(RequestError::InvalidParameter, "amount is required when absent from the URI");
+        if (uri->amount_sats && *uri->amount_sats > MAX_MONEY) return Rejected(RequestError::InvalidParameter, "URI amount out of range");
+
+        PaymentIntent intent;
+        intent.uri = request.uri;
+        intent.relay = request.relay;
+        intent.amount = request.amount.value_or(uri->amount_sats ? static_cast<CAmount>(*uri->amount_sats) : 0);
+        intent.timeout = std::chrono::seconds{request.timeout_seconds.value_or(120)};
+
+        if (m_network_check) {
+            if (auto error = m_network_check()) return Rejected(RequestError::NetworkPolicy, std::move(*error));
+        }
+
+        {
+            LOCK(m_wallet.cs_wallet);
+            if (m_wallet.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS) || m_wallet.IsWalletFlagSet(WALLET_FLAG_EXTERNAL_SIGNER)) {
+                return Rejected(RequestError::UnsupportedWallet, "Payjoin requires local private keys");
+            }
+            if (m_wallet.IsLocked()) return Rejected(RequestError::Locked, "Wallet must be unlocked to accept a Payjoin payment");
+
+            intent.max_fee = request.max_total_fee.value_or(m_wallet.m_max_tx_fee);
+            if (intent.max_fee <= 0 || intent.max_fee > m_wallet.m_max_tx_fee) {
+                return Rejected(RequestError::FeePolicy, "max_total_fee must be positive and must not exceed the wallet maximum");
+            }
+
+            CCoinControl control;
+            control.m_feerate = request.fee_rate;
+            intent.fee_rate = GetMinimumFeeRate(m_wallet, control).fee_rate;
+            if (intent.fee_rate.GetFeePerK() <= 0 || (request.fee_rate && intent.fee_rate != *request.fee_rate)) {
+                return Rejected(RequestError::FeePolicy, "Wallet policy could not provide the requested fee rate");
+            }
+            if (intent.fee_rate > m_wallet.m_max_tx_fee_rate) return Rejected(RequestError::FeePolicy, "fee_rate exceeds the wallet maximum");
+        }
+
+        if (const auto valid = ValidatePaymentIntent(intent); !valid) return Rejected(RequestError::InvalidParameter, valid.error());
+
+        if (!m_transport) m_transport = m_transport_factory();
+        if (!m_transport) throw std::runtime_error{"Payjoin transport creation failed"};
+
+        Subscribe();
+        const auto id = RegisterPayment(std::move(intent), std::move(request));
+        return {CommandStatus::Completed, {View(m_payments.at(id))}};
+    }
+
+    void RefreshPayments(std::optional<uint256> id) EXCLUSIVE_LOCKS_REQUIRED(m_gate, !m_views_mutex)
+    {
+        AssertLockHeld(m_gate);
+        LOCK(m_wallet.cs_wallet);
+        for (auto& [payment_id, payment] : m_payments) {
+            if (id && payment_id != *id) continue;
+
+            try {
+                Observe(payment);
+                ApplySettlement(payment);
+                Update(payment);
+            } catch (const std::bad_alloc&) {
+                throw;
+            } catch (const std::exception&) {
+                StorageFailure(payment, "wallet operation failed; effects require reconciliation");
+            }
+        }
+    }
+
+    ManagerResult ReadPayments(std::optional<uint256> id) EXCLUSIVE_LOCKS_REQUIRED(m_gate, !m_views_mutex)
+    {
+        AssertLockHeld(m_gate);
+        if (id && !m_payments.contains(*id)) return {CommandStatus::NotFound};
+
+        RefreshPayments(id);
+        ManagerResult result;
+        for (const auto& [payment_id, payment] : m_payments) {
+            if (!id || payment_id == *id) result.payments.push_back(View(payment));
+        }
+        return result;
+    }
+
+    void Notify() EXCLUSIVE_LOCKS_REQUIRED(!m_operations_mutex)
+    {
+        LOCK(m_operations_mutex);
+        if (m_lifecycle != Lifecycle::Running || m_observation_pending) return;
+
+        m_observation_pending = true;
+        m_executor.insert([weak = weak_from_this()] {
+            const auto state = weak.lock();
+            if (!state) return;
+
+            LOCK(state->m_gate);
+            {
+                LOCK(state->m_operations_mutex);
+                if (state->m_lifecycle != Lifecycle::Running) return;
+
+                state->m_observation_pending = false;
+            }
+
+            state->RefreshPayments(std::nullopt);
+        });
+    }
+
+    struct Notifications final : interfaces::Chain::Notifications {
+        std::weak_ptr<State> m_state;
+
+        explicit Notifications(const std::shared_ptr<State>& owner) : m_state{owner} {}
+
+        void Changed()
+        {
+            if (auto owner = m_state.lock()) owner->Notify();
+        }
+
+        void transactionAddedToMempool(const CTransactionRef&) override { Changed(); }
+
+        void transactionRemovedFromMempool(const CTransactionRef&, MemPoolRemovalReason) override { Changed(); }
+
+        void blockConnected(const kernel::ChainstateRole&, const interfaces::BlockInfo&) override { Changed(); }
+
+        void blockDisconnected(const interfaces::BlockInfo&) override { Changed(); }
+    };
+
+    void Subscribe() EXCLUSIVE_LOCKS_REQUIRED(m_gate)
+    {
+        AssertLockHeld(m_gate);
+        if (!m_notifications) m_notifications = m_chain.handleNotifications(std::make_shared<Notifications>(shared_from_this()));
     }
 
     [[nodiscard]] bool Store(Payment& payment) EXCLUSIVE_LOCKS_REQUIRED(!m_views_mutex)
@@ -390,7 +679,7 @@ struct SenderService::State : std::enable_shared_from_this<State> {
         return true;
     }
 
-    void Prepare(Payment& payment) EXCLUSIVE_LOCKS_REQUIRED(!m_views_mutex)
+    void Prepare(Payment& payment) EXCLUSIVE_LOCKS_REQUIRED(!m_views_mutex, !m_operations_mutex)
     {
         if (payment.phase != PaymentPhase::Queued) return;
 
@@ -401,8 +690,19 @@ struct SenderService::State : std::enable_shared_from_this<State> {
             return;
         }
 
+        if (m_now() >= payment.deadline) {
+            Fail(payment, PaymentIssue::Deadline, "payment deadline reached");
+            return;
+        }
+
         const auto destination = DecodeDestination(uri->address);
         LOCK(m_wallet.cs_wallet);
+        if (m_wallet.IsLocked() || m_wallet.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS) ||
+            m_wallet.IsWalletFlagSet(WALLET_FLAG_EXTERNAL_SIGNER)) {
+            Fail(payment, PaymentIssue::Preparation, "Payjoin requires an unlocked wallet with local private keys");
+            return;
+        }
+
         CCoinControl control;
         control.m_feerate = intent.fee_rate;
 
@@ -715,6 +1015,12 @@ struct SenderService::State : std::enable_shared_from_this<State> {
     void Sign(Payment& payment, PartiallySignedTransaction proposal) EXCLUSIVE_LOCKS_REQUIRED(!m_views_mutex)
     {
         LOCK(m_wallet.cs_wallet);
+        if (m_wallet.IsLocked() || m_wallet.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS) ||
+            m_wallet.IsWalletFlagSet(WALLET_FLAG_EXTERNAL_SIGNER)) {
+            Fail(payment, PaymentIssue::Signing, "Payjoin requires an unlocked wallet with local private keys");
+            return;
+        }
+
         Observe(payment);
         ApplySettlement(payment);
         if (!CheckInputs(payment)) return;
@@ -1044,39 +1350,39 @@ struct SenderService::State : std::enable_shared_from_this<State> {
         payment.diagnostic.clear();
     }
 
-    void RetrySigning(Payment& payment) EXCLUSIVE_LOCKS_REQUIRED(!m_views_mutex)
+    CommandOutcome RetrySigning(Payment& payment) EXCLUSIVE_LOCKS_REQUIRED(!m_views_mutex)
     {
         LOCK(m_wallet.cs_wallet);
-        if (payment.storage.uncertain) return Refuse(payment, CommandRefusal::StorageUncertain);
-        if (payment.selected) return Refuse(payment, CommandRefusal::Selected);
-        if (payment.settlement || payment.storage.released) return Refuse(payment, CommandRefusal::Settled);
+        if (payment.storage.uncertain) return Refuse(CommandRefusal::StorageUncertain);
+        if (payment.selected) return Refuse(CommandRefusal::Selected);
+        if (payment.settlement || payment.storage.released) return Refuse(CommandRefusal::Settled);
         if (!payment.session || payment.phase == PaymentPhase::Cancelled || payment.phase == PaymentPhase::Stopped) {
-            return Refuse(payment, CommandRefusal::InvalidState);
+            return Refuse(CommandRefusal::InvalidState);
         }
 
         auto outcome = payment.session->Outcome();
         auto* proposal = outcome ? std::get_if<SenderProposal>(&*outcome) : nullptr;
-        if (!proposal) return Refuse(payment, CommandRefusal::InvalidState);
+        if (!proposal) return Refuse(CommandRefusal::InvalidState);
 
-        payment.command_refusal.reset();
         Sign(payment, std::move(proposal->psbt));
-        if (payment.issue == PaymentIssue::Reservation) Refuse(payment, CommandRefusal::InputsChanged);
+        if (payment.issue == PaymentIssue::Reservation) return Refuse(CommandRefusal::InputsChanged);
+        return {payment.node_accepted && !payment.storage.uncertain ? CommandStatus::Completed : CommandStatus::Failed};
     }
 
-    void RetryPublication(Payment& payment) EXCLUSIVE_LOCKS_REQUIRED(!m_views_mutex)
+    CommandOutcome RetryPublication(Payment& payment) EXCLUSIVE_LOCKS_REQUIRED(!m_views_mutex)
     {
         LOCK(m_wallet.cs_wallet);
         Observe(payment);
         ApplySettlement(payment);
 
-        if (payment.storage.uncertain) return Refuse(payment, CommandRefusal::StorageUncertain);
-        if (payment.storage.released || payment.settlement) return Refuse(payment, CommandRefusal::Settled);
-        if (!payment.selected || !payment.storage.selection_saved || !payment.wallet_recorded) return Refuse(payment, CommandRefusal::InvalidState);
+        if (payment.storage.uncertain) return Refuse(CommandRefusal::StorageUncertain);
+        if (payment.storage.released || payment.settlement) return Refuse(CommandRefusal::Settled);
+        if (!payment.selected || !payment.storage.selection_saved || !payment.wallet_recorded) return Refuse(CommandRefusal::InvalidState);
 
         auto known = m_wallet.mapWallet.find(payment.selected->GetHash());
         if (known == m_wallet.mapWallet.end() || !known->second.GetTx()->Equals(*payment.selected)) {
             Fail(payment, PaymentIssue::Publication, "selected transaction requires reconciliation");
-            return;
+            return {CommandStatus::Failed};
         }
 
         auto batch = m_wallet.GetDatabase().MakeBatch();
@@ -1084,19 +1390,20 @@ struct SenderService::State : std::enable_shared_from_this<State> {
             uint256 owner;
             if (!batch->Read(OwnerKey(input.prevout), owner) || owner != payment.id) {
                 Fail(payment, PaymentIssue::Reservation, "reservation changed before publication retry");
-                return;
+                return {CommandStatus::Failed};
             }
         }
 
-        if (!CheckPublicationState(payment, known->second)) return;
+        if (!CheckPublicationState(payment, known->second)) return {CommandStatus::Failed};
         if (!m_wallet.GetBroadcastTransactions()) {
             Fail(payment, PaymentIssue::BroadcastDisabled, "wallet broadcast disabled");
-            return;
+            return {CommandStatus::Failed};
         }
 
         std::string error;
         const bool accepted = m_wallet.SubmitTxMemoryPoolAndRelay(known->second, error, node::TxBroadcast::MEMPOOL_AND_BROADCAST_TO_ALL);
         PublicationResult(payment, accepted, std::move(error));
+        return {accepted ? CommandStatus::Completed : CommandStatus::Failed};
     }
 
     [[nodiscard]] bool EndNegotiation(Payment& payment) EXCLUSIVE_LOCKS_REQUIRED(!m_views_mutex)
@@ -1128,32 +1435,33 @@ struct SenderService::State : std::enable_shared_from_this<State> {
         return true;
     }
 
-    void CancelPayment(Payment& payment) EXCLUSIVE_LOCKS_REQUIRED(!m_views_mutex)
+    CommandOutcome CancelPayment(Payment& payment) EXCLUSIVE_LOCKS_REQUIRED(!m_views_mutex)
     {
-        if (payment.settlement) return Refuse(payment, CommandRefusal::Settled);
-        if (payment.selected) return Refuse(payment, CommandRefusal::Selected);
+        if (payment.settlement) return Refuse(CommandRefusal::Settled);
+        if (payment.selected) return Refuse(CommandRefusal::Selected);
 
-        if (!EndNegotiation(payment) || !AbandonUnexposed(payment)) return;
+        if (!EndNegotiation(payment) || !AbandonUnexposed(payment)) return {CommandStatus::Failed};
 
         payment.phase = PaymentPhase::Cancelled;
         Update(payment);
+        return {CommandStatus::Completed};
     }
 
-    void Fallback(Payment& payment) EXCLUSIVE_LOCKS_REQUIRED(!m_views_mutex)
+    CommandOutcome Fallback(Payment& payment) EXCLUSIVE_LOCKS_REQUIRED(!m_views_mutex)
     {
-        if (const auto refusal = FallbackRefusal(payment)) return Refuse(payment, *refusal);
+        if (const auto refusal = FallbackRefusal(payment)) return Refuse(*refusal);
 
         LOCK(m_wallet.cs_wallet);
         Observe(payment);
         ApplySettlement(payment);
-        if (const auto refusal = FallbackRefusal(payment)) return Refuse(payment, *refusal);
+        if (const auto refusal = FallbackRefusal(payment)) return Refuse(*refusal);
 
         if (payment.original_presence != TransactionPresence::Missing) {
-            if (!CheckKnownOriginal(payment) || !EndNegotiation(payment)) return;
+            if (!CheckKnownOriginal(payment) || !EndNegotiation(payment)) return {CommandStatus::Failed};
 
             PublishChecked(payment, payment.original);
         } else {
-            if (!CheckInputs(payment) || !EndNegotiation(payment)) return;
+            if (!CheckInputs(payment) || !EndNegotiation(payment)) return {CommandStatus::Failed};
 
             Publish(payment, payment.original);
         }
@@ -1162,6 +1470,47 @@ struct SenderService::State : std::enable_shared_from_this<State> {
             auto closed = payment.session->CloseFallback();
             if (!closed) StorageFailure(payment, closed.error().message);
         }
+        return {payment.node_accepted && !payment.storage.uncertain ? CommandStatus::Completed : CommandStatus::Failed};
+    }
+
+    ManagerResult Command(const uint256& id, SenderCommand command) EXCLUSIVE_LOCKS_REQUIRED(m_gate, !m_views_mutex)
+    {
+        AssertLockHeld(m_gate);
+        const auto found = m_payments.find(id);
+        if (found == m_payments.end()) return {CommandStatus::NotFound};
+
+        auto& payment = found->second;
+        if (command != SenderCommand::Cancel && command != SenderCommand::Refresh && m_network_check) {
+            if (auto error = m_network_check()) {
+                auto result = Rejected(RequestError::NetworkPolicy, std::move(*error));
+                result.payments.push_back(View(payment));
+                return result;
+            }
+        }
+
+        CommandOutcome outcome{CommandStatus::Failed};
+        try {
+            switch (command) {
+            case SenderCommand::Cancel: outcome = CancelPayment(payment); break;
+            case SenderCommand::Fallback: outcome = Fallback(payment); break;
+            case SenderCommand::RetrySigning: outcome = RetrySigning(payment); break;
+            case SenderCommand::RetryPublication: outcome = RetryPublication(payment); break;
+            case SenderCommand::Refresh:
+                RefreshPayments(id);
+                outcome = {CommandStatus::Completed};
+                break;
+            }
+        } catch (const std::bad_alloc&) {
+            throw;
+        } catch (const std::exception&) {
+            StorageFailure(payment, "wallet operation failed; effects require reconciliation");
+        }
+
+        Update(payment);
+        ManagerResult result{outcome.status, {View(payment)}};
+        result.refusal = outcome.refusal;
+        if (outcome.status == CommandStatus::Failed) result.diagnostic = payment.diagnostic;
+        return result;
     }
 };
 
@@ -1169,26 +1518,60 @@ SenderService::SenderService(CWallet& wallet, SerialTaskRunner& executor,
                              std::unique_ptr<SenderTransport> transport, Now now, Schedule schedule)
     : m_state{std::make_shared<State>(wallet, executor, std::move(transport), std::move(now), std::move(schedule))} {}
 
+SenderService::SenderService(CWallet& wallet, SerialTaskRunner& executor,
+                             TransportFactory transport, Now now, Schedule schedule, NetworkCheck network_check)
+    : m_state{std::make_shared<State>(wallet, executor, std::move(transport), std::move(now), std::move(schedule), std::move(network_check))} {}
+
 SenderService::~SenderService() { Stop(); }
 
 uint256 SenderService::Start(PaymentIntent intent)
 {
-    const auto id = GetRandHash();
-    {
-        LOCK(m_state->m_gate);
-        if (m_state->m_stopped) throw std::logic_error{"sender service stopped"};
+    LOCK(m_state->m_gate);
+    if (!m_state->Running()) throw std::logic_error{"sender service stopped"};
 
-        State::Payment payment;
-        payment.intent = std::move(intent);
-        payment.id = id;
-        payment.deadline = m_state->m_now() + std::clamp(payment.intent.timeout, std::chrono::milliseconds::zero(), std::chrono::milliseconds{std::chrono::hours{24}});
+    if (!m_state->m_transport) m_state->m_transport = m_state->m_transport_factory();
+    if (!m_state->m_transport) throw std::runtime_error{"Payjoin transport creation failed"};
 
-        auto [it, inserted] = m_state->m_payments.emplace(id, std::move(payment));
-        m_state->Update(it->second);
+    PaymentRequest requested;
+    requested.uri = intent.uri;
+    requested.relay = intent.relay;
+    requested.amount = intent.amount;
+    requested.fee_rate = intent.fee_rate;
+    requested.max_total_fee = intent.max_fee;
+    requested.timeout_seconds = std::chrono::duration_cast<std::chrono::seconds>(intent.timeout).count();
+    return m_state->RegisterPayment(std::move(intent), std::move(requested));
+}
+
+std::future<ManagerResult> SenderService::Send(PaymentRequest request)
+{
+    auto [operation, future] = m_state->Register(std::nullopt);
+    if (operation) {
+        m_state->RunOperation(operation, [request = std::move(request)](State& state) EXCLUSIVE_LOCKS_REQUIRED(state.m_gate) mutable {
+            return state.Accept(std::move(request));
+        });
     }
+    return std::move(future);
+}
 
-    m_state->Queue(id, [](State& state, State::Payment& payment) { state.Prepare(payment); });
-    return id;
+std::future<ManagerResult> SenderService::Read(std::optional<uint256> id)
+{
+    auto [operation, future] = m_state->Register(id);
+    if (operation && m_state->Running()) {
+        try {
+            m_state->m_chain.requestNotificationBarrier([weak = std::weak_ptr{m_state}, operation, id] {
+                if (auto state = weak.lock()) {
+                    state->RunOperation(operation, [id](State& running) EXCLUSIVE_LOCKS_REQUIRED(running.m_gate) {
+                        return running.ReadPayments(id);
+                    });
+                }
+            });
+        } catch (const std::bad_alloc&) {
+            throw;
+        } catch (const std::exception&) {
+            m_state->Finish(operation, {CommandStatus::Failed, {}, false, RequestError::Internal, "Payjoin read barrier failed"}, true);
+        }
+    }
+    return std::move(future);
 }
 
 std::optional<PaymentSnapshot> SenderService::Snapshot(const uint256& id) const
@@ -1199,57 +1582,44 @@ std::optional<PaymentSnapshot> SenderService::Snapshot(const uint256& id) const
     return it->second;
 }
 
-void SenderService::Cancel(const uint256& id)
+void SenderService::Cancel(const uint256& id) { (void)Execute(id, SenderCommand::Cancel); }
+
+void SenderService::PublishFallback(const uint256& id) { (void)Execute(id, SenderCommand::Fallback); }
+
+void SenderService::RetryPublication(const uint256& id) { (void)Execute(id, SenderCommand::RetryPublication); }
+
+void SenderService::RetrySigning(const uint256& id) { (void)Execute(id, SenderCommand::RetrySigning); }
+
+void SenderService::Refresh(const uint256& id) { (void)Execute(id, SenderCommand::Refresh); }
+
+std::future<ManagerResult> SenderService::Execute(const uint256& id, SenderCommand command)
 {
-    m_state->Queue(id, [](State& state, State::Payment& payment) {
-        payment.command_refusal.reset();
-        state.CancelPayment(payment);
-    });
+    auto [operation, future] = m_state->Register(id);
+    if (operation) {
+        m_state->RunOperation(operation, [id, command](State& state) EXCLUSIVE_LOCKS_REQUIRED(state.m_gate) {
+            return state.Command(id, command);
+        });
+    }
+    return std::move(future);
 }
 
-void SenderService::PublishFallback(const uint256& id)
+void SenderService::Close()
 {
-    m_state->Queue(id, [](State& state, State::Payment& payment) {
-        payment.command_refusal.reset();
-        state.Fallback(payment);
-    });
-}
-
-void SenderService::RetryPublication(const uint256& id)
-{
-    m_state->Queue(id, [](State& state, State::Payment& payment) {
-        payment.command_refusal.reset();
-        state.RetryPublication(payment);
-    });
-}
-
-void SenderService::RetrySigning(const uint256& id)
-{
-    m_state->Queue(id, [](State& state, State::Payment& payment) {
-        payment.command_refusal.reset();
-        state.RetrySigning(payment);
-    });
-}
-
-void SenderService::Refresh(const uint256& id)
-{
-    m_state->Queue(id, [](State& state, State::Payment& payment) {
-        payment.command_refusal.reset();
-        LOCK(state.m_wallet.cs_wallet);
-        state.Observe(payment);
-        state.ApplySettlement(payment);
-        state.Update(payment);
-    });
+    LOCK(m_state->m_operations_mutex);
+    if (m_state->m_lifecycle == State::Lifecycle::Running) m_state->m_lifecycle = State::Lifecycle::Closing;
 }
 
 void SenderService::Stop()
 {
     LOCK(m_state->m_stop_mutex);
+    if (WITH_LOCK(m_state->m_operations_mutex, return m_state->m_lifecycle == State::Lifecycle::Stopped)) return;
+
+    Close();
+
+    std::unique_ptr<interfaces::Handler> notifications;
     {
         LOCK(m_state->m_gate);
-        if (m_state->m_stopped) return;
-        m_state->m_stopped = true;
-
+        notifications = std::move(m_state->m_notifications);
         for (auto& [id, payment] : m_state->m_payments) {
             try {
                 m_state->RetireRequest(payment);
@@ -1261,8 +1631,11 @@ void SenderService::Stop()
         }
     }
 
-    m_state->m_transport->Stop();
+    if (notifications) notifications->disconnect();
 
+    if (m_state->m_transport) m_state->m_transport->Stop();
+
+    auto archive = std::make_shared<std::vector<PaymentView>>();
     {
         LOCK(m_state->m_gate);
         for (auto& [id, payment] : m_state->m_payments) {
@@ -1284,8 +1657,44 @@ void SenderService::Stop()
 
             payment.session.reset();
             if (!payment.selected && !payment.settlement) payment.phase = PaymentPhase::Stopped;
-            m_state->Update(payment);
+
+            auto view = State::View(payment);
+            view.payment.cancel_available = false;
+            view.payment.fallback_available = false;
+            view.payment.signing_available = false;
+            view.payment.publication_retry_available = false;
+
+            {
+                LOCK(m_state->m_views_mutex);
+                m_state->m_views[view.payment.id] = view.payment;
+            }
+            archive->push_back(std::move(view));
         }
+
+        m_state->m_payments.clear();
+        m_state->m_request_ids.clear();
+        m_state->m_transport_factory = {};
+        m_state->m_network_check = {};
+        m_state->m_schedule = {};
+        m_state->m_now = {};
     }
+    notifications.reset();
+
+    {
+        LOCK(m_state->m_operations_mutex);
+        m_state->m_archive = archive;
+        for (const auto& operation : m_state->m_operations) {
+            operation->promise.set_value(State::StoppedResult(*archive, operation->id));
+        }
+        m_state->m_operations.clear();
+
+        m_state->m_lifecycle = State::Lifecycle::Stopped;
+    }
+}
+
+std::shared_ptr<const std::vector<PaymentView>> SenderService::Archive() const
+{
+    LOCK(m_state->m_operations_mutex);
+    return m_state->m_archive;
 }
 } // namespace wallet::payjoin
