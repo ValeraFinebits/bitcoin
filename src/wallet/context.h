@@ -5,6 +5,8 @@
 #ifndef BITCOIN_WALLET_CONTEXT_H
 #define BITCOIN_WALLET_CONTEXT_H
 
+#include <bitcoin-build-config.h> // IWYU pragma: keep
+
 #include <sync.h>
 
 #include <functional>
@@ -21,6 +23,14 @@ class Wallet;
 
 namespace wallet {
 class CWallet;
+namespace payjoin {
+class SenderManager;
+
+//! Delete the manager without requiring its definition in WalletContext.
+struct SenderManagerDeleter {
+    void operator()(SenderManager* manager) const;
+};
+} // namespace payjoin
 using LoadWalletFn = std::function<void(std::unique_ptr<interfaces::Wallet> wallet)>;
 
 //! WalletContext struct containing references to state shared between CWallet
@@ -37,6 +47,10 @@ struct WalletContext {
     interfaces::Chain* chain{nullptr};
     CScheduler* scheduler{nullptr};
     ArgsManager* args{nullptr}; // Currently a raw pointer because the memory is not managed by this struct
+#ifdef ENABLE_PAYJOIN
+    std::unique_ptr<payjoin::SenderManager, payjoin::SenderManagerDeleter> payjoin;
+#endif // ENABLE_PAYJOIN
+
     // It is unsafe to lock this after locking a CWallet::cs_wallet mutex because
     // this could introduce inconsistent lock ordering and cause deadlocks.
     Mutex wallets_mutex;
@@ -49,6 +63,11 @@ struct WalletContext {
     WalletContext();
     ~WalletContext();
 };
+
+#ifdef ENABLE_PAYJOIN
+//! Stop this wallet load's Payjoin work without adding sender dependencies to CWallet.
+void UnloadPayjoinWallet(WalletContext& context, const std::shared_ptr<CWallet>& wallet);
+#endif // ENABLE_PAYJOIN
 } // namespace wallet
 
 #endif // BITCOIN_WALLET_CONTEXT_H
