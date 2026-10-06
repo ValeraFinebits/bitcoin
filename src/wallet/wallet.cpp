@@ -176,6 +176,10 @@ bool RemoveWallet(WalletContext& context, const std::shared_ptr<CWallet>& wallet
 {
     assert(wallet);
 
+#ifdef ENABLE_PAYJOIN
+    UnloadPayjoinWallet(context, wallet);
+#endif // ENABLE_PAYJOIN
+
     interfaces::Chain& chain = wallet->chain();
     std::string name = wallet->GetName();
     WITH_LOCK(wallet->cs_wallet, wallet->WriteBestBlock());

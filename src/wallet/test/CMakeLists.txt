@@ -32,6 +32,7 @@ if(ENABLE_PAYJOIN)
   target_sources(test_bitcoin
     PRIVATE
       payjoin_tests.cpp
+      payjoin_manager_tests.cpp
       payjoin_sender_fixture.cpp
       payjoin_sender_tests.cpp
   )
