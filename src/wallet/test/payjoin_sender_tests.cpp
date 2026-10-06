@@ -625,6 +625,10 @@ BOOST_AUTO_TEST_CASE(sender_stop_waits_for_active_operation_without_draining_tim
     auto scheduled = std::make_unique<SenderService>(
         *m_sender, executor, std::move(transport), SenderService::Clock::now,
         std::move(schedule), SenderService::NetworkCheck{});
+    std::promise<void> closed;
+    auto admission_closed = closed.get_future();
+    std::promise<void> finished;
+    auto stopped = finished.get_future();
     SchedulerTestCleanup cleanup{scheduler, scheduled, &unblock};
     scheduler.m_service_thread = std::thread{[&] { scheduler.serviceQueue(); }};
     scheduler.scheduleFromNow([] { BOOST_ERROR("future timer must not be drained during Stop"); }, std::chrono::hours{24});
@@ -635,10 +639,6 @@ BOOST_AUTO_TEST_CASE(sender_stop_waits_for_active_operation_without_draining_tim
     request.fee_rate = CFeeRate{1000};
     auto accepted = scheduled->Send(request);
     BOOST_REQUIRE(operation_entered.wait_for(std::chrono::seconds{5}) == std::future_status::ready);
-    std::promise<void> closed;
-    auto admission_closed = closed.get_future();
-    std::promise<void> finished;
-    auto stopped = finished.get_future();
     cleanup.m_stopper = std::thread{[&] {
         scheduled->Close();
         closed.set_value();
@@ -807,13 +807,13 @@ BOOST_AUTO_TEST_CASE(sender_operations_during_transport_stop_receive_final_deliv
         m_timers.emplace(m_now + delay, std::move(fn));
     };
     m_service = std::make_unique<SenderService>(*m_sender, *m_queue, std::move(transport), [this] { return m_now; }, std::move(schedule));
+    std::promise<void> finished;
+    auto stopped = finished.get_future();
     SchedulerTestCleanup cleanup{m_scheduler, m_service, &unblock};
     const auto id = m_service->Start(Intent());
     Flush();
     BOOST_REQUIRE(m_service->Snapshot(id)->possibly_exposed);
 
-    std::promise<void> finished;
-    auto stopped = finished.get_future();
     cleanup.m_stopper = std::thread{[&] {
         m_service->Stop();
         finished.set_value();
@@ -3110,7 +3110,7 @@ BOOST_AUTO_TEST_CASE(sender_confirmed_release_failure_survives_refresh)
     }
 
     m_database->FailNextWrite(FaultDatabase::WriteTarget::Payment, FaultDatabase::WriteFailure::AfterWrite);
-    m_service->Refresh(id);
+    auto failed_refresh = m_service->Execute(id, SenderCommand::Refresh);
     Flush();
 
     const auto failed = *m_service->Snapshot(id);
@@ -3121,6 +3121,13 @@ BOOST_AUTO_TEST_CASE(sender_confirmed_release_failure_survives_refresh)
     BOOST_CHECK(failed.owns_inputs);
     BOOST_CHECK(!failed.locks_verified);
     BOOST_CHECK(!failed.diagnostic.empty());
+    const auto failed_result = failed_refresh.get();
+    BOOST_CHECK(failed_result.status == CommandStatus::Failed);
+    BOOST_CHECK_EQUAL(failed_result.diagnostic, failed.diagnostic);
+    BOOST_CHECK(!ReadStoredPayment(id).released);
+    for (const auto& input : original->vin) {
+        BOOST_CHECK(ReadOwner(input.prevout) == id);
+    }
 
     const auto writes = m_database->WriteCount();
     m_database->CheckWriteFailed();
@@ -3136,6 +3143,8 @@ BOOST_AUTO_TEST_CASE(sender_confirmed_release_failure_survives_refresh)
     BOOST_CHECK(!repeated.locks_verified);
     BOOST_CHECK_EQUAL(m_database->WriteCount(), writes);
     const auto refresh_result = refresh_future.get();
+    BOOST_CHECK(refresh_result.status == CommandStatus::Completed);
+    BOOST_CHECK(refresh_result.diagnostic.empty());
     BOOST_CHECK(!refresh_result.refusal);
 
     auto publication_future = m_service->Execute(id, SenderCommand::RetryPublication);
@@ -3151,6 +3160,203 @@ BOOST_AUTO_TEST_CASE(sender_confirmed_release_failure_survives_refresh)
     const auto final_refresh_result = final_refresh_future.get();
     BOOST_CHECK(!final_refresh_result.refusal);
     BOOST_CHECK(m_service->Snapshot(id)->phase == PaymentPhase::Confirmed);
+}
+
+BOOST_AUTO_TEST_CASE(sender_observation_exception_reports_failure_per_invocation)
+{
+    for (const bool read : {false, true}) {
+        const auto id = m_service->Start(Intent());
+        Flush();
+        const auto original = m_service->Snapshot(id)->original;
+        BOOST_REQUIRE(original);
+        Confirm(original);
+        const auto records = ReadRecords(*m_database, {PAYMENT_RECORD, OWNER_RECORD, DBKeys::LOCKED_UTXO});
+        bool triggered{false};
+        ScopedHook hook{m_database->m_on_read};
+        m_database->m_on_read = [&](const std::string& type) {
+            if (type != OWNER_RECORD) return;
+
+            triggered = true;
+            throw std::runtime_error{"ownership read failed"};
+        };
+        auto pending = read ? m_service->Read(id) : m_service->Execute(id, SenderCommand::Refresh);
+        Flush();
+        hook.Reset();
+        BOOST_REQUIRE(triggered);
+        const auto result = pending.get();
+        BOOST_CHECK(result.status == CommandStatus::Failed);
+        BOOST_REQUIRE_EQUAL(result.payments.size(), 1);
+        const auto& payment = result.payments.front().payment;
+        BOOST_CHECK(payment.issue == PaymentIssue::Storage);
+        BOOST_CHECK(payment.storage_uncertain);
+        BOOST_CHECK(payment.owns_inputs);
+        BOOST_CHECK(!result.diagnostic.empty());
+        BOOST_CHECK_EQUAL(result.diagnostic, payment.diagnostic);
+        BOOST_CHECK(ReadRecords(*m_database, {PAYMENT_RECORD, OWNER_RECORD, DBKeys::LOCKED_UTXO}) == records);
+
+        const auto writes = m_database->WriteCount();
+        auto repeated = read ? m_service->Read(id) : m_service->Execute(id, SenderCommand::Refresh);
+        Flush();
+        const auto repeated_result = repeated.get();
+        BOOST_CHECK(repeated_result.status == CommandStatus::Completed);
+        BOOST_CHECK(repeated_result.diagnostic.empty());
+        BOOST_CHECK_EQUAL(repeated_result.payments.front().payment.diagnostic, payment.diagnostic);
+        BOOST_CHECK_EQUAL(m_database->WriteCount(), writes);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(sender_read_failure_still_updates_other_payments)
+{
+    const auto first = m_service->Start(Intent());
+    Flush();
+    const auto second = m_service->Start(Intent());
+    Flush();
+    const auto failed_id = std::min(first, second);
+    const auto settled_id = std::max(first, second);
+    const auto original = m_service->Snapshot(failed_id)->original;
+    const auto other = m_service->Snapshot(settled_id)->original;
+    BOOST_REQUIRE(original);
+    BOOST_REQUIRE(other);
+    Confirm(original);
+    Confirm(other);
+    m_database->FailNextWrite(FaultDatabase::WriteTarget::Payment, FaultDatabase::WriteFailure::AfterWrite);
+
+    auto pending = m_service->Read();
+    Flush();
+    const auto result = pending.get();
+    BOOST_CHECK(result.status == CommandStatus::Failed);
+    BOOST_REQUIRE_EQUAL(result.payments.size(), 2);
+    const auto& failed = result.payments.front().payment;
+    BOOST_CHECK(failed.id == failed_id);
+    BOOST_CHECK(failed.storage_uncertain);
+    BOOST_CHECK(failed.owns_inputs);
+    BOOST_CHECK(failed.issue == PaymentIssue::Storage);
+    BOOST_CHECK(!result.diagnostic.empty());
+    BOOST_CHECK_EQUAL(result.diagnostic, failed.diagnostic);
+    BOOST_CHECK(!ReadStoredPayment(failed_id).released);
+    for (const auto& input : original->vin) {
+        BOOST_CHECK(ReadOwner(input.prevout) == failed_id);
+    }
+    BOOST_CHECK(result.payments.back().payment.id == settled_id);
+    CheckReleased(settled_id);
+    m_database->CheckWriteFailed();
+
+    const auto writes = m_database->WriteCount();
+    auto repeated = m_service->Read();
+    Flush();
+    const auto repeated_result = repeated.get();
+    BOOST_CHECK(repeated_result.status == CommandStatus::Completed);
+    BOOST_CHECK(repeated_result.diagnostic.empty());
+    BOOST_CHECK_EQUAL(repeated_result.payments.front().payment.diagnostic, failed.diagnostic);
+    BOOST_CHECK_EQUAL(m_database->WriteCount(), writes);
+}
+
+BOOST_AUTO_TEST_CASE(sender_notification_release_failure_preserves_uncertainty)
+{
+    PaymentRequest request;
+    request.uri = m_uri;
+    request.relay = m_relay;
+    request.fee_rate = CFeeRate{1000};
+    auto pending = m_service->Send(std::move(request));
+    Flush();
+    const auto accepted = pending.get();
+    BOOST_REQUIRE(accepted.status == CommandStatus::Completed);
+    BOOST_REQUIRE_EQUAL(accepted.payments.size(), 1);
+    const auto id = accepted.payments.front().payment.id;
+    const auto original = m_service->Snapshot(id)->original;
+    BOOST_REQUIRE(original);
+    Confirm(original);
+    {
+        LOCK(m_sender->cs_wallet);
+        for (const auto& input : original->vin) {
+            BOOST_REQUIRE(m_sender->LockCoin(input.prevout, true));
+        }
+    }
+    m_database->FailNextWrite(FaultDatabase::WriteTarget::Payment, FaultDatabase::WriteFailure::AfterWrite);
+    Flush();
+
+    const auto failed = *m_service->Snapshot(id);
+    BOOST_REQUIRE(failed.settlement);
+    BOOST_CHECK(failed.phase == PaymentPhase::Confirmed);
+    BOOST_CHECK(failed.issue == PaymentIssue::Storage);
+    BOOST_CHECK(failed.storage_uncertain);
+    BOOST_CHECK(failed.owns_inputs);
+    BOOST_CHECK(!failed.locks_verified);
+    BOOST_CHECK(!failed.diagnostic.empty());
+    BOOST_CHECK(!ReadStoredPayment(id).released);
+    for (const auto& input : original->vin) {
+        BOOST_CHECK(ReadOwner(input.prevout) == id);
+    }
+    m_database->CheckWriteFailed();
+
+    const auto writes = m_database->WriteCount();
+    m_node.validation_signals->TransactionRemovedFromMempool(original, MemPoolRemovalReason::BLOCK, 0);
+    Flush();
+    BOOST_CHECK_EQUAL(m_database->WriteCount(), writes);
+    BOOST_CHECK(m_service->Snapshot(id)->storage_uncertain);
+    BOOST_CHECK_EQUAL(m_service->Snapshot(id)->diagnostic, failed.diagnostic);
+}
+
+BOOST_AUTO_TEST_CASE(sender_queued_notification_does_not_settle_during_stop)
+{
+    m_service->Stop();
+    std::promise<void> unblock;
+    auto transport = std::make_unique<BlockingStopTransport>(unblock.get_future().share());
+    auto entered = transport->m_entered.get_future();
+    m_transport = transport.get();
+    m_service = MakeService(std::move(transport));
+    std::promise<void> finished;
+    auto stopped = finished.get_future();
+    SchedulerTestCleanup cleanup{m_scheduler, m_service, &unblock};
+    PaymentRequest request;
+    request.uri = m_uri;
+    request.relay = m_relay;
+    request.fee_rate = CFeeRate{1000};
+    auto pending = m_service->Send(std::move(request));
+    Flush();
+    const auto accepted = pending.get();
+    BOOST_REQUIRE_EQUAL(accepted.payments.size(), 1);
+    const auto id = accepted.payments.front().payment.id;
+    const auto original = m_service->Snapshot(id)->original;
+    BOOST_REQUIRE(original);
+    BOOST_REQUIRE_EQUAL(m_transport->m_pending.size(), 1);
+    auto dispatch = std::move(m_transport->m_pending.front());
+    m_transport->m_pending.pop_front();
+    dispatch.complete({Delivery::Uncertain, {}, "delivery uncertain"});
+    Flush();
+    Confirm(original);
+    m_node.chain->waitForNotifications();
+    BOOST_REQUIRE(!m_service->Snapshot(id)->settlement);
+    BOOST_REQUIRE(m_service->Snapshot(id)->owns_inputs);
+
+    cleanup.m_stopper = std::thread{[&] {
+        m_service->Stop();
+        finished.set_value();
+    }};
+    BOOST_REQUIRE(entered.wait_for(std::chrono::seconds{5}) == std::future_status::ready);
+    const auto records = ReadRecords(*m_database, {PAYMENT_RECORD, JOURNAL_RECORD, OWNER_RECORD, DBKeys::LOCKED_UTXO});
+    const auto writes = m_database->WriteCount();
+    m_queue->flush();
+    BOOST_CHECK(!m_service->Snapshot(id)->settlement);
+    BOOST_CHECK(m_service->Snapshot(id)->owns_inputs);
+    BOOST_CHECK(m_service->Snapshot(id)->issue == PaymentIssue::Delivery);
+    BOOST_CHECK_EQUAL(m_database->WriteCount(), writes);
+    BOOST_CHECK(ReadRecords(*m_database, {PAYMENT_RECORD, JOURNAL_RECORD, OWNER_RECORD, DBKeys::LOCKED_UTXO}) == records);
+
+    cleanup.Release();
+    BOOST_REQUIRE(stopped.wait_for(std::chrono::seconds{5}) == std::future_status::ready);
+    cleanup.m_stopper.join();
+    const auto stopped_records = ReadRecords(*m_database, {PAYMENT_RECORD, JOURNAL_RECORD, OWNER_RECORD, DBKeys::LOCKED_UTXO});
+    const auto stopped_writes = m_database->WriteCount();
+    Flush();
+    const auto final = *m_service->Snapshot(id);
+    BOOST_CHECK(final.phase == PaymentPhase::Stopped);
+    BOOST_CHECK(!final.selected);
+    BOOST_CHECK(!final.node_accepted);
+    BOOST_CHECK(!final.settlement);
+    BOOST_CHECK_EQUAL(m_transport->m_attempts, 1);
+    BOOST_CHECK_EQUAL(m_database->WriteCount(), stopped_writes);
+    BOOST_CHECK(ReadRecords(*m_database, {PAYMENT_RECORD, JOURNAL_RECORD, OWNER_RECORD, DBKeys::LOCKED_UTXO}) == stopped_records);
 }
 
 BOOST_AUTO_TEST_CASE(sender_busy_waits_without_repeating_accepted_initial_post)
@@ -3711,8 +3917,11 @@ BOOST_AUTO_TEST_CASE(sender_reorg_original_does_not_restore_released_ownership)
 
     Disconnect(block);
     for (int i = 0; i < 2; ++i) {
-        m_service->Refresh(id);
+        auto refreshed = m_service->Execute(id, SenderCommand::Refresh);
         Flush();
+        const auto result = refreshed.get();
+        BOOST_CHECK(result.status == CommandStatus::Completed);
+        BOOST_CHECK(result.diagnostic.empty());
 
         const auto view = *m_service->Snapshot(id);
         BOOST_CHECK(!view.settlement);
