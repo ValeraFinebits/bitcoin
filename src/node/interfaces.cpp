@@ -773,7 +773,11 @@ public:
         LOCK(chainman().GetMutex());
         return GetPruneHeight(chainman().m_blockman, chainman().ActiveChain());
     }
+
     bool isReadyToBroadcast() override { return !chainman().m_blockman.LoadingBlocks() && !isInitialBlockDownload(); }
+
+    bool isNetworkActive() override { return m_node.connman && m_node.connman->GetNetworkActive(); }
+
     bool isInitialBlockDownload() override
     {
         return chainman().IsInitialBlockDownload();
@@ -799,11 +803,21 @@ public:
     {
         validation_signals().SyncWithValidationInterfaceQueue();
     }
+
+    void requestNotificationBarrier(std::function<void()> callback) override
+    {
+        validation_signals().CallFunctionInValidationInterfaceQueue(std::move(callback));
+    }
+
     std::unique_ptr<Handler> handleRpc(const CRPCCommand& command) override
     {
         return std::make_unique<RpcHandlerImpl>(command);
     }
+
+    void rpcInterruptionPoint() override { m_node.rpc_interruption_point(); }
+
     bool rpcEnableDeprecated(const std::string& method) override { return IsDeprecatedRPCEnabled(method); }
+
     common::SettingsValue getSetting(const std::string& name) override
     {
         return args().GetSetting(name);
