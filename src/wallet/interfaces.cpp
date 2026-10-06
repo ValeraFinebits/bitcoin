@@ -14,6 +14,7 @@
 #include <pubkey.h>
 #include <rpc/server.h>
 #include <scheduler.h>
+#include <span.h>
 #include <support/allocators/secure.h>
 #include <sync.h>
 #include <uint256.h>
@@ -29,6 +30,7 @@
 #include <wallet/load.h>
 #ifdef ENABLE_PAYJOIN
 #include <wallet/payjoin/manager.h>
+#include <wallet/rpc/payjoin.h>
 #endif // ENABLE_PAYJOIN
 #include <wallet/receive.h>
 #include <wallet/rpc/wallet.h>
@@ -561,15 +563,25 @@ public:
     //! ChainClient methods
     void registerRpcs() override
     {
-        for (const CRPCCommand& command : GetWalletRPCCommands()) {
-            m_rpc_commands.emplace_back(command.category, command.name, [this, &command](const JSONRPCRequest& request, UniValue& result, bool last_handler) {
-                JSONRPCRequest wallet_request = request;
-                wallet_request.context = &m_context;
-                return command.actor(wallet_request, result, last_handler);
-            }, command.argNames, command.unique_id);
-            m_rpc_commands.back().metadata_fn = command.metadata_fn;
-            m_rpc_handlers.emplace_back(m_context.chain->handleRpc(m_rpc_commands.back()));
-        }
+        const auto register_commands = [this](std::span<const CRPCCommand> commands) {
+            for (const CRPCCommand& command : commands) {
+                m_rpc_commands.emplace_back(
+                    command.category, command.name,
+                    [this, &command](const JSONRPCRequest& request, UniValue& result, bool last_handler) {
+                        JSONRPCRequest wallet_request = request;
+                        wallet_request.context = &m_context;
+                        return command.actor(wallet_request, result, last_handler);
+                    },
+                    command.argNames, command.unique_id);
+                m_rpc_commands.back().metadata_fn = command.metadata_fn;
+                m_rpc_handlers.emplace_back(m_context.chain->handleRpc(m_rpc_commands.back()));
+            }
+        };
+
+        register_commands(GetWalletRPCCommands());
+#ifdef ENABLE_PAYJOIN
+        register_commands(GetPayjoinRPCCommands());
+#endif // ENABLE_PAYJOIN
     }
     bool verify() override { return VerifyWallets(m_context); }
     bool load() override { return LoadWallets(m_context); }
