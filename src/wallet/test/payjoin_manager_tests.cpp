@@ -6,6 +6,7 @@
 #include <consensus/amount.h>
 #include <consensus/validation.h>
 #include <interfaces/chain.h>
+#include <key_io.h>
 #include <net.h>
 #include <netbase.h>
 #include <node/context.h>
@@ -17,9 +18,12 @@
 #include <uint256.h>
 #include <validation.h>
 #include <validationinterface.h>
+#include <wallet/context.h>
 #include <wallet/payjoin/manager.h>
 #include <wallet/payjoin/sender.h>
+#include <wallet/scan.h>
 #include <wallet/test/payjoin_sender_fixture.h>
+#include <wallet/test/util.h>
 #include <wallet/wallet.h>
 
 #include <boost/test/unit_test.hpp>
@@ -305,6 +309,56 @@ BOOST_AUTO_TEST_CASE(manager_duplicate_ignores_changed_mutable_admission_conditi
     BOOST_CHECK(Await(m_manager.Send(m_loaded, new_request)).error == RequestError::NetworkPolicy);
 
     BOOST_CHECK(Await(m_manager.Execute(m_loaded, id, SenderCommand::Cancel)).status == CommandStatus::Completed);
+}
+
+BOOST_AUTO_TEST_CASE(manager_remove_wallet_releases_managed_wallet)
+{
+    WalletContext context;
+    context.args = m_node.args;
+    context.chain = m_node.chain.get();
+    context.payjoin.reset(new SenderManager{*context.chain, *context.args});
+    auto wallet = TestCreateWallet(CreateMockableWalletDatabase(), context, WALLET_FLAG_DESCRIPTORS);
+    struct WalletCleanup {
+        WalletContext& context;
+        std::shared_ptr<CWallet>& wallet;
+
+        ~WalletCleanup()
+        {
+            context.payjoin->Stop();
+            if (wallet) RemoveWallet(context, wallet, std::nullopt);
+        }
+    } cleanup{context, wallet};
+    BOOST_REQUIRE(AddWallet(context, wallet));
+    {
+        LOCK(wallet->cs_wallet);
+        CreateDescriptor(*wallet, "combo(" + EncodeSecret(m_sender_key) + ")", true);
+        wallet->m_fallback_fee = CFeeRate{1000};
+        wallet->SetBroadcastTransactions(true);
+    }
+    {
+        WalletRescanReserver reserver{*wallet};
+        BOOST_REQUIRE(reserver.reserve());
+        BOOST_REQUIRE(wallet->Scanner().Scan(context.chain->getBlockHash(0), 0, std::nullopt, reserver, false).status == ScanResult::SUCCESS);
+    }
+    const auto accepted = Await(context.payjoin->Send(wallet, Request()));
+    BOOST_REQUIRE(accepted.status == CommandStatus::Completed);
+    BOOST_REQUIRE_EQUAL(accepted.payments.size(), 1);
+    const auto id = accepted.payments.front().payment.id;
+    const auto prepared = Await(context.payjoin->Read(wallet, id));
+    BOOST_REQUIRE_EQUAL(prepared.payments.size(), 1);
+    BOOST_REQUIRE(prepared.payments.front().payment.original);
+    BOOST_REQUIRE(prepared.payments.front().payment.owns_inputs);
+    std::weak_ptr<CWallet> released = wallet;
+
+    BOOST_REQUIRE(RemoveWallet(context, wallet, std::nullopt));
+    BOOST_CHECK(WITH_LOCK(context.wallets_mutex, return context.wallets.empty()));
+    const auto stopped = Await(context.payjoin->Read(wallet, id));
+    BOOST_CHECK(stopped.status == CommandStatus::Stopped);
+    BOOST_REQUIRE_EQUAL(stopped.payments.size(), 1);
+    BOOST_CHECK(stopped.payments.front().payment.phase == PaymentPhase::Stopped);
+    m_node.chain->waitForNotifications();
+    wallet.reset();
+    BOOST_CHECK(released.expired());
 }
 
 BOOST_AUTO_TEST_CASE(manager_unload_rejects_old_instance_and_isolates_same_name)
