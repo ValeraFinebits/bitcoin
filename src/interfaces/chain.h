@@ -284,6 +284,9 @@ public:
     //! Check if the node is ready to broadcast transactions.
     virtual bool isReadyToBroadcast() = 0;
 
+    //! Whether the node currently permits network activity.
+    virtual bool isNetworkActive() = 0;
+
     //! Check if in IBD.
     virtual bool isInitialBlockDownload() = 0;
 
@@ -339,9 +342,15 @@ public:
     //! Wait for all pending notifications up to this point to be processed
     virtual void waitForNotifications() = 0;
 
+    //! Enqueue a barrier without blocking its caller (for interruptible RPC waits).
+    virtual void requestNotificationBarrier(std::function<void()> callback) = 0;
+
     //! Register handler for RPC. Command is not copied, so reference
     //! needs to remain valid until Handler is disconnected.
     virtual std::unique_ptr<Handler> handleRpc(const CRPCCommand& command) = 0;
+
+    //! Check for RPC interruption through the node's configured callback.
+    virtual void rpcInterruptionPoint() = 0;
 
     //! Check if deprecated RPC is enabled.
     virtual bool rpcEnableDeprecated(const std::string& method) = 0;
