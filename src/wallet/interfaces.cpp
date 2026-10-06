@@ -2,12 +2,13 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#include <interfaces/wallet.h>
+#include <bitcoin-build-config.h> // IWYU pragma: keep
 
 #include <common/args.h>
 #include <consensus/amount.h>
 #include <interfaces/chain.h>
 #include <interfaces/handler.h>
+#include <interfaces/wallet.h>
 #include <node/types.h>
 #include <primitives/transaction.h>
 #include <pubkey.h>
@@ -26,10 +27,13 @@
 #include <wallet/fees.h>
 #include <wallet/imports.h>
 #include <wallet/load.h>
+#ifdef ENABLE_PAYJOIN
+#include <wallet/payjoin/manager.h>
+#endif // ENABLE_PAYJOIN
 #include <wallet/receive.h>
 #include <wallet/rpc/wallet.h>
-#include <wallet/spend.h>
 #include <wallet/scan.h>
+#include <wallet/spend.h>
 #include <wallet/wallet.h>
 
 #include <memory>
@@ -572,9 +576,22 @@ public:
     void start(CScheduler& scheduler) override
     {
         m_context.scheduler = &scheduler;
+#ifdef ENABLE_PAYJOIN
+        m_context.payjoin.reset(new payjoin::SenderManager{*m_context.chain, *m_context.args});
+#endif // ENABLE_PAYJOIN
+
         return StartWallets(m_context);
     }
-    void stop() override { return UnloadWallets(m_context); }
+
+    void stop() override
+    {
+#ifdef ENABLE_PAYJOIN
+        if (m_context.payjoin) m_context.payjoin->Stop();
+#endif // ENABLE_PAYJOIN
+
+        return UnloadWallets(m_context);
+    }
+
     void setMockTime(int64_t time) override { return SetMockTime(std::chrono::seconds{time}); }
     void schedulerMockForward(std::chrono::seconds delta) override { Assert(m_context.scheduler)->MockForward(delta); }
 
