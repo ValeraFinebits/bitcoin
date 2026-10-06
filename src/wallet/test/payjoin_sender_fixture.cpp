@@ -122,6 +122,20 @@ void FaultDatabase::CheckTransactionFailed(Transaction operation) const
     if (operation == Transaction::Abort) BOOST_CHECK(m_failed_abort_completed);
 }
 
+void FaultDatabase::LoseNextCommitAcknowledgement()
+{
+    BOOST_REQUIRE(!m_lose_commit_acknowledgement);
+
+    m_lose_commit_acknowledgement = true;
+    m_lost_commit_acknowledgements = 0;
+}
+
+void FaultDatabase::CheckCommitAcknowledgementLost() const
+{
+    BOOST_CHECK(!m_lose_commit_acknowledgement);
+    BOOST_CHECK_EQUAL(m_lost_commit_acknowledgements, 1);
+}
+
 void FaultDatabase::SetEraseFailure(std::string type)
 {
     m_fail_erase = std::move(type);
@@ -227,8 +241,15 @@ bool FaultDatabase::Batch::TxnBegin()
 bool FaultDatabase::Batch::TxnCommit()
 {
     const bool result = !m_db.FailTransaction(Transaction::Commit) && SQLiteBatch::TxnCommit();
-    if (m_db.m_on_transaction) m_db.m_on_transaction(Transaction::Commit, result);
-    return result;
+    bool reported = result;
+    if (result && m_db.m_lose_commit_acknowledgement) {
+        m_db.m_lose_commit_acknowledgement = false;
+        ++m_db.m_lost_commit_acknowledgements;
+        reported = false;
+    }
+
+    if (m_db.m_on_transaction) m_db.m_on_transaction(Transaction::Commit, reported);
+    return reported;
 }
 
 std::unique_ptr<DatabaseCursor> FaultDatabase::Batch::GetNewPrefixCursor(std::span<const std::byte> prefix)
@@ -333,6 +354,14 @@ void SenderFixture::Shutdown()
 {
     m_service->Stop();
     m_scheduler.stop();
+    m_queue->flush();
+}
+
+void SenderFixture::Flush()
+{
+    BOOST_REQUIRE(m_execution == Execution::Controlled);
+    m_queue->flush();
+    m_node.chain->waitForNotifications();
     m_queue->flush();
 }
 

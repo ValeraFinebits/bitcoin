@@ -14,11 +14,14 @@
 #include <util/expected.h>
 
 #include <chrono>
+#include <cstdint>
 #include <functional>
+#include <future>
 #include <memory>
 #include <optional>
 #include <string>
 #include <utility>
+#include <vector>
 
 class SerialTaskRunner;
 
@@ -112,9 +115,14 @@ struct PaymentSnapshot {
 
     std::optional<SpendObservation> settlement;
 
-    std::optional<CommandRefusal> command_refusal;
     std::optional<PaymentIssue> issue;
     std::string diagnostic;
+
+    std::chrono::steady_clock::time_point deadline;
+
+    bool cancel_available{false};
+    bool signing_available{false};
+    bool publication_retry_available{false};
 };
 
 struct PaymentIntent {
@@ -127,7 +135,60 @@ struct PaymentIntent {
     std::chrono::milliseconds poll_interval{std::chrono::seconds{1}};
 };
 
+struct PaymentRequest {
+    std::string uri;
+    std::string relay;
+    std::optional<CAmount> amount;
+    std::optional<CFeeRate> fee_rate;
+    std::optional<CAmount> max_total_fee;
+    std::optional<int64_t> timeout_seconds;
+    std::optional<std::string> request_id;
+
+    bool operator==(const PaymentRequest&) const = default;
+};
+
+struct PaymentView {
+    PaymentSnapshot payment;
+    PaymentRequest requested;
+    PaymentIntent effective;
+};
+
+enum class RequestError {
+    InvalidParameter,
+    Locked,
+    UnsupportedWallet,
+    FeePolicy,
+    NetworkPolicy,
+    IdempotencyConflict,
+    Internal,
+};
+
 util::Expected<PayjoinUriInfo, std::string> ValidatePaymentIntent(const PaymentIntent& intent);
+
+enum class SenderCommand {
+    Cancel,
+    Fallback,
+    RetrySigning,
+    RetryPublication,
+    Refresh,
+};
+
+enum class CommandStatus {
+    Completed,
+    Refused,
+    Failed,
+    Stopped,
+    NotFound,
+};
+
+struct ManagerResult {
+    CommandStatus status{CommandStatus::Completed};
+    std::vector<PaymentView> payments{};
+    bool duplicate{false};
+    std::optional<RequestError> error{};
+    std::string diagnostic{};
+    std::optional<CommandRefusal> refusal{};
+};
 
 class SenderService
 {
@@ -135,9 +196,14 @@ public:
     using Clock = std::chrono::steady_clock;
     using Now = std::function<Clock::time_point()>;
     using Schedule = std::function<void(std::chrono::milliseconds, std::function<void()>)>;
+    using TransportFactory = std::function<std::unique_ptr<SenderTransport>()>;
+    using NetworkCheck = std::function<std::optional<std::string>()>;
 
     explicit SenderService(CWallet& wallet, SerialTaskRunner& executor,
                            std::unique_ptr<SenderTransport> transport, Now now, Schedule schedule);
+
+    explicit SenderService(CWallet& wallet, SerialTaskRunner& executor,
+                           TransportFactory transport, Now now, Schedule schedule, NetworkCheck network_check);
     ~SenderService();
 
     SenderService(const SenderService&) = delete;
@@ -145,6 +211,10 @@ public:
     SenderService& operator=(const SenderService&) = delete;
 
     [[nodiscard]] uint256 Start(PaymentIntent intent);
+
+    std::future<ManagerResult> Send(PaymentRequest request);
+
+    std::future<ManagerResult> Read(std::optional<uint256> id = std::nullopt);
 
     [[nodiscard]] std::optional<PaymentSnapshot> Snapshot(const uint256& id) const;
 
@@ -158,7 +228,13 @@ public:
 
     void Refresh(const uint256& id);
 
+    std::future<ManagerResult> Execute(const uint256& id, SenderCommand command);
+
+    void Close();
+
     void Stop();
+
+    std::shared_ptr<const std::vector<PaymentView>> Archive() const;
 
 private:
     struct State;

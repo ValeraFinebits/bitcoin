@@ -97,6 +97,8 @@ private:
 
     std::map<Transaction, TransactionFailure> m_transaction_failures;
     bool m_failed_abort_completed{false};
+    bool m_lose_commit_acknowledgement{false};
+    size_t m_lost_commit_acknowledgements{0};
     std::string m_fail_erase;
     size_t m_erase_failures{0};
     CursorFault m_cursor_fault{CursorFault::None};
@@ -131,6 +133,10 @@ public:
     void SetTransactionFailure(Transaction operation, bool enabled = true);
 
     void CheckTransactionFailed(Transaction operation) const;
+
+    void LoseNextCommitAcknowledgement();
+
+    void CheckCommitAcknowledgementLost() const;
 
     void SetEraseFailure(std::string type);
 
@@ -207,6 +213,8 @@ struct SenderFixture : TestChain100Setup {
     ~SenderFixture() { Shutdown(); }
 
     void Shutdown();
+
+    void Flush();
 
     PaymentIntent Intent() { return {m_uri, m_relay, COIN, CFeeRate{1000}, COIN / 100}; }
 
