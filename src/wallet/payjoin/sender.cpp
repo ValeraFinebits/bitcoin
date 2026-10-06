@@ -557,23 +557,27 @@ struct SenderService::State : std::enable_shared_from_this<State> {
         return {CommandStatus::Completed, {View(m_payments.at(id))}};
     }
 
-    void RefreshPayments(std::optional<uint256> id) EXCLUSIVE_LOCKS_REQUIRED(m_gate, !m_views_mutex)
+    [[nodiscard]] util::Expected<void, std::string> RefreshPayments(std::optional<uint256> id) EXCLUSIVE_LOCKS_REQUIRED(m_gate, !m_views_mutex)
     {
         AssertLockHeld(m_gate);
         LOCK(m_wallet.cs_wallet);
+        util::Expected<void, std::string> result;
         for (auto& [payment_id, payment] : m_payments) {
             if (id && payment_id != *id) continue;
 
             try {
                 Observe(payment);
-                ApplySettlement(payment);
+                auto settled = ApplySettlement(payment);
+                if (!settled && result) result = util::Unexpected<std::string>{std::move(settled.error())};
                 Update(payment);
             } catch (const std::bad_alloc&) {
                 throw;
             } catch (const std::exception&) {
                 StorageFailure(payment, "wallet operation failed; effects require reconciliation");
+                if (result) result = util::Unexpected<std::string>{payment.diagnostic};
             }
         }
+        return result;
     }
 
     ManagerResult ReadPayments(std::optional<uint256> id) EXCLUSIVE_LOCKS_REQUIRED(m_gate, !m_views_mutex)
@@ -581,8 +585,9 @@ struct SenderService::State : std::enable_shared_from_this<State> {
         AssertLockHeld(m_gate);
         if (id && !m_payments.contains(*id)) return {CommandStatus::NotFound};
 
-        RefreshPayments(id);
-        ManagerResult result;
+        auto refreshed = RefreshPayments(id);
+        ManagerResult result{refreshed ? CommandStatus::Completed : CommandStatus::Failed};
+        if (!refreshed) result.diagnostic = std::move(refreshed.error());
         for (const auto& [payment_id, payment] : m_payments) {
             if (!id || payment_id == *id) result.payments.push_back(View(payment));
         }
@@ -607,7 +612,7 @@ struct SenderService::State : std::enable_shared_from_this<State> {
                 state->m_observation_pending = false;
             }
 
-            state->RefreshPayments(std::nullopt);
+            (void)state->RefreshPayments(std::nullopt);
         });
     }
 
@@ -883,7 +888,11 @@ struct SenderService::State : std::enable_shared_from_this<State> {
         });
         if (inputs_spent || payment.observed_spend) {
             Observe(payment);
-            ApplySettlement(payment);
+            if (!ApplySettlement(payment)) {
+                Discard(payment);
+                Update(payment);
+                return;
+            }
         }
 
         if (!CheckInputs(payment)) {
@@ -1022,7 +1031,7 @@ struct SenderService::State : std::enable_shared_from_this<State> {
         }
 
         Observe(payment);
-        ApplySettlement(payment);
+        if (!ApplySettlement(payment)) return;
         if (!CheckInputs(payment)) return;
 
         auto tx = proposal.GetUnsignedTx();
@@ -1322,9 +1331,9 @@ struct SenderService::State : std::enable_shared_from_this<State> {
         }
     }
 
-    void ApplySettlement(Payment& payment) EXCLUSIVE_LOCKS_REQUIRED(!m_views_mutex)
+    [[nodiscard]] util::Expected<void, std::string> ApplySettlement(Payment& payment) EXCLUSIVE_LOCKS_REQUIRED(!m_views_mutex)
     {
-        if (!payment.storage.registered) return;
+        if (!payment.storage.registered) return {};
 
         if (payment.settlement && (!payment.observed_spend || payment.observed_spend->presence != TransactionPresence::Confirmed)) {
             payment.settlement.reset();
@@ -1343,11 +1352,12 @@ struct SenderService::State : std::enable_shared_from_this<State> {
             payment.phase = payment.settlement->kind == SpendKind::Other ? PaymentPhase::Conflicted : PaymentPhase::Confirmed;
         }
 
-        if (!payment.settlement || payment.storage.uncertain) return;
-        if (!payment.storage.released && !Release(payment)) return;
+        if (!payment.settlement || payment.storage.uncertain) return {};
+        if (!payment.storage.released && !Release(payment)) return util::Unexpected<std::string>{payment.diagnostic};
 
         payment.issue.reset();
         payment.diagnostic.clear();
+        return {};
     }
 
     CommandOutcome RetrySigning(Payment& payment) EXCLUSIVE_LOCKS_REQUIRED(!m_views_mutex)
@@ -1373,7 +1383,7 @@ struct SenderService::State : std::enable_shared_from_this<State> {
     {
         LOCK(m_wallet.cs_wallet);
         Observe(payment);
-        ApplySettlement(payment);
+        if (!ApplySettlement(payment)) return {CommandStatus::Failed};
 
         if (payment.storage.uncertain) return Refuse(CommandRefusal::StorageUncertain);
         if (payment.storage.released || payment.settlement) return Refuse(CommandRefusal::Settled);
@@ -1453,7 +1463,7 @@ struct SenderService::State : std::enable_shared_from_this<State> {
 
         LOCK(m_wallet.cs_wallet);
         Observe(payment);
-        ApplySettlement(payment);
+        if (!ApplySettlement(payment)) return {CommandStatus::Failed};
         if (const auto refusal = FallbackRefusal(payment)) return Refuse(*refusal);
 
         if (payment.original_presence != TransactionPresence::Missing) {
@@ -1495,10 +1505,11 @@ struct SenderService::State : std::enable_shared_from_this<State> {
             case SenderCommand::Fallback: outcome = Fallback(payment); break;
             case SenderCommand::RetrySigning: outcome = RetrySigning(payment); break;
             case SenderCommand::RetryPublication: outcome = RetryPublication(payment); break;
-            case SenderCommand::Refresh:
-                RefreshPayments(id);
-                outcome = {CommandStatus::Completed};
+            case SenderCommand::Refresh: {
+                const auto refreshed = RefreshPayments(id);
+                outcome = {refreshed ? CommandStatus::Completed : CommandStatus::Failed};
                 break;
+            }
             }
         } catch (const std::bad_alloc&) {
             throw;
