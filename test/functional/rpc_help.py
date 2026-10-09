@@ -18,7 +18,7 @@ def parse_string(s):
     assert_equal(s[-1], '"')
     return s[1:-1]
 
-def process_mapping(fname):
+def process_mapping(fname, *, payjoin_enabled):
     """Find and parse conversion table in implementation file `fname`."""
     cmds = []
     string_params = []
@@ -51,6 +51,13 @@ def process_mapping(fname):
                         cmds.append((name, idx, argname))
 
     assert not in_rpcs
+    if not payjoin_enabled:
+        payjoin_methods = {
+            'sendpayjoin', 'getpayjoin', 'listpayjoins',
+            'cancelpayjoin', 'publishpayjoinfallback', 'retrypayjoin',
+        }
+        cmds = [entry for entry in cmds if entry[0] not in payjoin_methods]
+        string_params = [entry for entry in string_params if entry[0] not in payjoin_methods]
     return cmds, string_params
 
 class HelpRpcTest(BitcoinTestFramework):
@@ -68,7 +75,7 @@ class HelpRpcTest(BitcoinTestFramework):
 
     def test_client_conversion_table(self):
         file_conversion_table = os.path.join(self.config["environment"]["SRCDIR"], 'src', 'rpc', 'client.cpp')
-        mapping_client, _ = process_mapping(file_conversion_table)
+        mapping_client, _ = process_mapping(file_conversion_table, payjoin_enabled=self.config.getboolean("components", "ENABLE_PAYJOIN"))
         # Ignore echojson in client table
         mapping_client = [m for m in mapping_client if m[0] != 'echojson']
 
@@ -76,7 +83,7 @@ class HelpRpcTest(BitcoinTestFramework):
         # Filter all RPCs whether they need conversion
         mapping_server_conversion = [tuple(m[:3]) for m in mapping_server if not m[3]]
 
-        # Only check if all RPC methods have been compiled (i.e. wallet is enabled)
+        # Compare all remaining entries when wallet support is compiled.
         if self.is_wallet_compiled() and sorted(mapping_client) != sorted(mapping_server_conversion):
             raise AssertionError("RPC client conversion table ({}) and RPC server named arguments mismatch!\n{}".format(
                 file_conversion_table,
@@ -99,7 +106,7 @@ class HelpRpcTest(BitcoinTestFramework):
 
     def test_client_string_conversion_table(self):
         file_conversion_table = os.path.join(self.config["environment"]["SRCDIR"], 'src', 'rpc', 'client.cpp')
-        _, string_params_client = process_mapping(file_conversion_table)
+        _, string_params_client = process_mapping(file_conversion_table, payjoin_enabled=self.config.getboolean("components", "ENABLE_PAYJOIN"))
         mapping_server = self.nodes[0].help("dump_all_command_conversions")
         server_tuples = {tuple(m[:3]) for m in mapping_server}
 
