@@ -13,14 +13,20 @@
 #include <policy/feerate.h>
 #include <primitives/block.h>
 #include <primitives/transaction.h>
+#include <rpc/protocol.h>
+#include <rpc/request.h>
+#include <rpc/server.h>
 #include <sync.h>
 #include <txmempool.h>
 #include <uint256.h>
+#include <univalue.h>
 #include <validation.h>
 #include <validationinterface.h>
 #include <wallet/context.h>
 #include <wallet/payjoin/manager.h>
 #include <wallet/payjoin/sender.h>
+#include <wallet/rpc/payjoin.h>
+#include <wallet/rpc/wallet.h>
 #include <wallet/scan.h>
 #include <wallet/test/payjoin_sender_fixture.h>
 #include <wallet/test/util.h>
@@ -135,6 +141,55 @@ BOOST_AUTO_TEST_CASE(manager_empty_reads_and_unknown_commands_do_not_write)
     BOOST_CHECK(Await(m_manager.Read(m_loaded, uint256::ONE)).status == CommandStatus::NotFound);
     BOOST_CHECK(Await(m_manager.Execute(m_loaded, uint256::ONE, SenderCommand::Cancel)).status == CommandStatus::NotFound);
     BOOST_CHECK_EQUAL(m_database->WriteCount(), writes);
+}
+
+BOOST_AUTO_TEST_CASE(manager_rpc_retry_accepts_advertised_actions)
+{
+    WalletContext context;
+    context.chain = m_node.chain.get();
+    context.args = m_node.args;
+    WITH_LOCK(context.wallets_mutex, context.wallets.push_back(m_loaded));
+    context.payjoin.reset(new SenderManager{*m_node.chain, *m_node.args});
+
+    const auto accepted = Await(context.payjoin->Send(m_loaded, Request()));
+    BOOST_REQUIRE_EQUAL(accepted.payments.size(), 1);
+    const auto id = accepted.payments.front().payment.id;
+    (void)Await(context.payjoin->Read(m_loaded, id));
+
+    const auto call = [&](const std::string& method, std::optional<std::string> action = std::nullopt) -> UniValue {
+        JSONRPCRequest request;
+        request.context = &context;
+        request.strMethod = method;
+        request.params = UniValue::VARR;
+        request.params.push_back(id.GetHex());
+        if (action) request.params.push_back(*action);
+        for (const auto& command : GetPayjoinRPCCommands()) {
+            if (command.name != method) continue;
+            UniValue result;
+            BOOST_REQUIRE(command.actor(request, result, true));
+            return result;
+        }
+        throw std::logic_error{"Payjoin RPC command not found"};
+    };
+
+    BOOST_REQUIRE_EQUAL(call("publishpayjoinfallback")["result"].get_str(), "completed");
+    const auto payment = call("getpayjoin");
+    const auto& actions = payment["available_actions"].getValues();
+    BOOST_REQUIRE_EQUAL(actions.size(), 1);
+    BOOST_CHECK_EQUAL(actions.front().get_str(), "retry_publication");
+    const auto retried = call("retrypayjoin", actions.front().get_str());
+    BOOST_CHECK_EQUAL(retried["result"].get_str(), "completed");
+    BOOST_CHECK_EQUAL(retried["payment"]["selected"]["txid"].get_str(), payment["selected"]["txid"].get_str());
+
+    const auto signing = call("retrypayjoin", "retry_signing");
+    BOOST_CHECK_EQUAL(signing["result"].get_str(), "refused");
+    BOOST_CHECK_EQUAL(signing["refusal"].get_str(), "selected");
+    for (const auto* action : {"signing", "publication", "unknown"}) {
+        BOOST_CHECK_EXCEPTION(call("retrypayjoin", action), UniValue, [](const UniValue& error) {
+            return error["code"].getInt<int>() == RPC_INVALID_PARAMETER &&
+                   error["message"].get_str() == "action must be retry_signing or retry_publication";
+        });
+    }
 }
 
 BOOST_AUTO_TEST_CASE(manager_preaccept_failure_does_not_claim_request_id)
@@ -283,6 +338,98 @@ BOOST_AUTO_TEST_CASE(manager_notification_during_settlement_causes_follow_up_wit
     BOOST_CHECK(!observed.settlement);
     BOOST_CHECK(!observed.storage_uncertain);
     BOOST_CHECK(ReadStoredPayment(id).released);
+}
+
+BOOST_AUTO_TEST_CASE(manager_rpc_shutdown_interrupts_wait_before_service_stop)
+{
+    WalletContext context;
+    context.chain = m_node.chain.get();
+    context.args = m_node.args;
+    WITH_LOCK(context.wallets_mutex, context.wallets.push_back(m_loaded));
+    context.payjoin.reset(new SenderManager{*m_node.chain, *m_node.args});
+    BOOST_REQUIRE(!IsRPCRunning());
+
+    CRPCTable table;
+    for (const auto& command : GetWalletRPCCommands()) {
+        table.appendCommand(command.name, &command);
+    }
+    for (const auto& command : GetPayjoinRPCCommands()) {
+        table.appendCommand(command.name, &command);
+    }
+
+    struct RpcState {
+        node::NodeContext& m_node;
+        std::function<void()> m_previous;
+
+        explicit RpcState(node::NodeContext& node)
+            : m_node{node}, m_previous{std::exchange(node.rpc_interruption_point, RpcInterruptionPoint)}
+        {
+            StartRPC();
+        }
+
+        ~RpcState()
+        {
+            InterruptRPC();
+            m_node.rpc_interruption_point = std::move(m_previous);
+        }
+    } rpc_state{m_node};
+
+    if (RPCIsInWarmup(nullptr)) SetRPCWarmupFinished();
+
+    auto barrier = std::make_shared<Barrier>();
+    ReleaseOnExit early_release{barrier};
+    auto entered = barrier->m_entered.get_future();
+    m_database->m_on_write = [barrier](const std::string& type) {
+        if (type == test::PAYMENT_RECORD) barrier->Pause();
+    };
+    const auto accepted = Await(context.payjoin->Send(m_loaded, Request()));
+    BOOST_REQUIRE_EQUAL(accepted.payments.size(), 1);
+    const auto id = accepted.payments.front().payment.id;
+    Await(std::move(entered));
+
+    auto validation = std::make_shared<Barrier>();
+    ReleaseOnExit early_validation_release{validation};
+    auto validation_entered = validation->m_entered.get_future();
+    m_node.chain->requestNotificationBarrier([validation] { validation->Pause(); });
+    Await(std::move(validation_entered));
+
+    auto rpc = std::async(std::launch::async, [&] {
+        JSONRPCRequest request;
+        request.context = &context;
+        request.strMethod = "getpayjoin";
+        request.params = UniValue::VARR;
+        request.params.push_back(id.GetHex());
+        try {
+            (void)table.execute(request);
+            return 0;
+        } catch (const UniValue& error) {
+            return error["code"].getInt<int>();
+        }
+    });
+    ReleaseOnExit release{barrier};
+    ReleaseOnExit release_validation{validation};
+    const auto registration_deadline = std::chrono::steady_clock::now() + 10s;
+    while (m_node.validation_signals->CallbacksPending() == 0 && std::chrono::steady_clock::now() < registration_deadline) {
+        std::this_thread::yield();
+    }
+
+    BOOST_REQUIRE_GT(m_node.validation_signals->CallbacksPending(), 0);
+    InterruptRPC();
+    BOOST_CHECK_EQUAL(Await(std::move(rpc)), RPC_CLIENT_NOT_CONNECTED);
+
+    barrier->Open();
+    validation->Open();
+
+    ManagerResult current;
+    const auto observation_deadline = std::chrono::steady_clock::now() + 10s;
+    do {
+        current = Await(context.payjoin->Read(m_loaded, id));
+        BOOST_REQUIRE_EQUAL(current.payments.size(), 1);
+    } while (current.payments.front().payment.phase != PaymentPhase::Attention && std::chrono::steady_clock::now() < observation_deadline);
+    BOOST_REQUIRE_EQUAL(current.payments.size(), 1);
+    BOOST_CHECK(!current.payments.front().payment.storage_uncertain);
+    BOOST_CHECK(current.payments.front().payment.phase == PaymentPhase::Attention);
+    BOOST_CHECK(Await(context.payjoin->Send(m_loaded, Request())).duplicate);
 }
 
 BOOST_AUTO_TEST_CASE(manager_duplicate_ignores_changed_mutable_admission_conditions)
