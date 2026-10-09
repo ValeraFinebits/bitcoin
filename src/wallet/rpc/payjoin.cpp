@@ -499,20 +499,20 @@ RPCMethod retrypayjoin()
         "Does not restart preparation or negotiation. An expired negotiation deadline does not itself forbid these actions.\n",
         {
             {"payment_id", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Payment identifier in this wallet load"},
-            {"action", RPCArg::Type::STR, RPCArg::Optional::NO, "Required: signing or publication"},
+            {"action", RPCArg::Type::STR, RPCArg::Optional::NO, "Required: retry_signing or retry_publication"},
         },
         CommandResultHelp(),
-        RPCExamples{HelpExampleCli("retrypayjoin", "\"payment_id\" signing")},
+        RPCExamples{HelpExampleCli("retrypayjoin", "\"payment_id\" retry_signing")},
         [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
             const auto wallet = GetWalletForJSONRPCRequest(request);
             if (!wallet) return UniValue::VNULL;
 
             const auto id = ParseHashV(request.params[0], "payment_id");
             const auto action = request.params[1].get_str();
-            if (action != "signing" && action != "publication") throw JSONRPCError(RPC_INVALID_PARAMETER, "action must be signing or publication");
+            if (action != "retry_signing" && action != "retry_publication") throw JSONRPCError(RPC_INVALID_PARAMETER, "action must be retry_signing or retry_publication");
 
             return CommandJSON(WaitForPayjoin(request, Manager(request).Execute(wallet, id,
-                                                                                action == "signing" ? SenderCommand::RetrySigning : SenderCommand::RetryPublication)));
+                                                                                action == "retry_signing" ? SenderCommand::RetrySigning : SenderCommand::RetryPublication)));
         },
     };
 }

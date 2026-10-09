@@ -143,6 +143,55 @@ BOOST_AUTO_TEST_CASE(manager_empty_reads_and_unknown_commands_do_not_write)
     BOOST_CHECK_EQUAL(m_database->WriteCount(), writes);
 }
 
+BOOST_AUTO_TEST_CASE(manager_rpc_retry_accepts_advertised_actions)
+{
+    WalletContext context;
+    context.chain = m_node.chain.get();
+    context.args = m_node.args;
+    WITH_LOCK(context.wallets_mutex, context.wallets.push_back(m_loaded));
+    context.payjoin.reset(new SenderManager{*m_node.chain, *m_node.args});
+
+    const auto accepted = Await(context.payjoin->Send(m_loaded, Request()));
+    BOOST_REQUIRE_EQUAL(accepted.payments.size(), 1);
+    const auto id = accepted.payments.front().payment.id;
+    (void)Await(context.payjoin->Read(m_loaded, id));
+
+    const auto call = [&](const std::string& method, std::optional<std::string> action = std::nullopt) -> UniValue {
+        JSONRPCRequest request;
+        request.context = &context;
+        request.strMethod = method;
+        request.params = UniValue::VARR;
+        request.params.push_back(id.GetHex());
+        if (action) request.params.push_back(*action);
+        for (const auto& command : GetPayjoinRPCCommands()) {
+            if (command.name != method) continue;
+            UniValue result;
+            BOOST_REQUIRE(command.actor(request, result, true));
+            return result;
+        }
+        throw std::logic_error{"Payjoin RPC command not found"};
+    };
+
+    BOOST_REQUIRE_EQUAL(call("publishpayjoinfallback")["result"].get_str(), "completed");
+    const auto payment = call("getpayjoin");
+    const auto& actions = payment["available_actions"].getValues();
+    BOOST_REQUIRE_EQUAL(actions.size(), 1);
+    BOOST_CHECK_EQUAL(actions.front().get_str(), "retry_publication");
+    const auto retried = call("retrypayjoin", actions.front().get_str());
+    BOOST_CHECK_EQUAL(retried["result"].get_str(), "completed");
+    BOOST_CHECK_EQUAL(retried["payment"]["selected"]["txid"].get_str(), payment["selected"]["txid"].get_str());
+
+    const auto signing = call("retrypayjoin", "retry_signing");
+    BOOST_CHECK_EQUAL(signing["result"].get_str(), "refused");
+    BOOST_CHECK_EQUAL(signing["refusal"].get_str(), "selected");
+    for (const auto* action : {"signing", "publication", "unknown"}) {
+        BOOST_CHECK_EXCEPTION(call("retrypayjoin", action), UniValue, [](const UniValue& error) {
+            return error["code"].getInt<int>() == RPC_INVALID_PARAMETER &&
+                   error["message"].get_str() == "action must be retry_signing or retry_publication";
+        });
+    }
+}
+
 BOOST_AUTO_TEST_CASE(manager_preaccept_failure_does_not_claim_request_id)
 {
     auto request = Request();
