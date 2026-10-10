@@ -38,4 +38,5 @@ ifneq ($(PAYJOIN),1)
 $(error PAYJOIN_TESTS=1 requires PAYJOIN=1)
 endif
 payjoin_linux_packages+=payjoin_ffi_test
+payjoin_linux_native_packages+=native_payjoin_cli
 endif
