@@ -31,6 +31,7 @@
 #include <test/util/setup_common.h>
 #include <txmempool.h>
 #include <uint256.h>
+#include <univalue.h>
 #include <util/btcsignals.h>
 #include <util/fs.h>
 #include <util/result.h>
@@ -73,6 +74,15 @@ namespace wallet::payjoin {
 using namespace test;
 
 namespace {
+size_t CountEvent(const std::vector<std::string>& events, const std::string& name)
+{
+    return std::count_if(events.begin(), events.end(), [&name](const auto& event) {
+        UniValue value;
+        BOOST_REQUIRE(value.read(event));
+        return value.isObject() && value.exists(name);
+    });
+}
+
 class ForwardingTransport final : public ControlledTransport
 {
     std::unique_ptr<HttpSenderTransport> m_http;
@@ -340,13 +350,17 @@ struct IntegrationFixture : SenderFixture {
     }
 
     PartiallySignedTransaction SendProposal(const std::shared_ptr<::payjoin::UncheckedOriginalPayload>& original,
-                                            std::function<void(PartiallySignedTransaction&)> modify_psbt = {})
+                                            std::function<void(PartiallySignedTransaction&)> modify_psbt = {}, bool corrupt_response = false)
     {
         auto [proposal, signed_psbt] = BuildProposal(original, std::move(modify_psbt));
         auto post = proposal->create_post_request(m_relay);
         auto response = Post(m_receiver_http, {post.request->url, post.request->content_type, post.request->body});
         BOOST_REQUIRE_MESSAGE(response.delivery == Delivery::Response, response.diagnostic);
-        proposal->process_response(response.body, post.client_response);
+        const auto posted = CountEvent(m_log->load(), "PostedPayjoinProposal");
+        if (corrupt_response) response.body.clear();
+        auto monitor = proposal->process_response(response.body, post.client_response)->save(m_log);
+        BOOST_REQUIRE(monitor);
+        BOOST_CHECK_EQUAL(CountEvent(m_log->load(), "PostedPayjoinProposal"), posted + 1);
         return signed_psbt;
     }
 
@@ -1619,7 +1633,23 @@ BOOST_FIXTURE_TEST_CASE(sender_total_fee_policy_boundary, IntegrationFixture)
     }
 }
 
-BOOST_FIXTURE_TEST_CASE(sender_explicit_commands_replace_refusal, IntegrationFixture)
+BOOST_FIXTURE_TEST_CASE(receiver_rejects_malformed_proposal_response, IntegrationFixture)
+{
+    const auto id = m_service->Start(Intent());
+    Flush();
+    Deliver();
+
+    auto original = ReceiverOriginal();
+    const auto posted = CountEvent(m_log->load(), "PostedPayjoinProposal");
+    BOOST_CHECK_THROW(SendProposal(original, {}, true), ::payjoin::ReceiverPersistedError);
+    BOOST_CHECK_EQUAL(CountEvent(m_log->load(), "PostedPayjoinProposal"), posted);
+    const auto view = m_service->Snapshot(id);
+    BOOST_REQUIRE(view);
+    BOOST_CHECK(!view->selected);
+    BOOST_CHECK(!view->node_accepted);
+}
+
+BOOST_FIXTURE_TEST_CASE(sender_command_results_are_independent, IntegrationFixture)
 {
     const auto id = m_service->Start(Intent());
     Flush();
@@ -1630,8 +1660,14 @@ BOOST_FIXTURE_TEST_CASE(sender_explicit_commands_replace_refusal, IntegrationFix
     const auto publication_result = publication_future.get();
     BOOST_CHECK(publication_result.refusal == CommandRefusal::InvalidState);
 
+    BOOST_CHECK_EQUAL(CountEvent(Journal(id).first, "PostedOriginalPsbt"), 0);
     Deliver();
-    BOOST_CHECK(publication_result.refusal == CommandRefusal::InvalidState);
+    BOOST_CHECK_EQUAL(CountEvent(Journal(id).first, "PostedOriginalPsbt"), 1);
+    const auto view = m_service->Snapshot(id);
+    BOOST_REQUIRE(view);
+    BOOST_CHECK(!view->issue);
+    BOOST_CHECK(!view->selected);
+    BOOST_CHECK(!view->node_accepted);
 
     auto refresh_future = m_service->Execute(id, SenderCommand::Refresh);
     Flush();
