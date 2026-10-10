@@ -203,12 +203,28 @@ if [ "${RUN_PAYJOIN_INTEGRATION_TESTS:-false}" = "true" ]; then
     -DBUILD_TESTS=ON \
     -DBUILD_PAYJOIN_INTEGRATION_TESTS=ON \
     "-DPayjoinFFI_DIR=${DEPENDS_DIR}/${HOST}/tests/payjoin-ffi/lib/cmake/PayjoinFFI"
-  cmake --build "${integration_build}" "${MAKEJOBS}" --target test_payjoin_integration
+  cmake --build "${integration_build}" "${MAKEJOBS}" --target test_payjoin_integration payjoin_test_services
   ctest --test-dir "${integration_build}" \
     -L payjoin_integration \
     --output-on-failure \
     --no-tests=error \
     -j1
+  payjoin_results="${BASE_SCRATCH_DIR}/payjoin-functional.csv"
+  "${BASE_BUILD_DIR}/test/functional/test_runner.py" wallet_payjoin.py \
+    --payjoin-cli="${DEPENDS_DIR}/${HOST}/native/bin/payjoin-cli" \
+    --payjoin-test-services="${integration_build}/bin/payjoin_test_services" \
+    --tmpdirprefix="${BASE_SCRATCH_DIR}/payjoin-functional" \
+    --timeout-factor="${TEST_RUNNER_TIMEOUT_FACTOR}" \
+    --resultsfile="${payjoin_results}" \
+    --combinedlogslen=99999999 --failfast
+  python3 - "${payjoin_results}" <<'PY'
+import csv
+import sys
+
+with open(sys.argv[1], encoding="utf8") as results:
+    rows = list(csv.DictReader(results))
+assert any(row["test"] == "wallet_payjoin.py" and row["status"] == "Passed" for row in rows), rows
+PY
 fi
 
 if [ "$RUN_FUNCTIONAL_TESTS" = "true" ]; then
