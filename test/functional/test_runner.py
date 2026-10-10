@@ -91,6 +91,7 @@ EXTENDED_SCRIPTS = [
     'feature_dbcrash.py',
     'feature_index_prune.py',
     'feature_utxo_abort_on_error.py',
+    'wallet_payjoin.py',
 ]
 
 # Special script to run each bench sanity check

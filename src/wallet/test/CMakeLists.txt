@@ -66,6 +66,9 @@ if(ENABLE_PAYJOIN)
       Boost::headers
       $<TARGET_NAME_IF_EXISTS:USDT::headers>
     )
+    add_executable(payjoin_test_services payjoin_test_services.cpp)
+    target_include_directories(payjoin_test_services SYSTEM PRIVATE ${payjoin_cpp_includes})
+    target_link_libraries(payjoin_test_services core_interface bitcoin_payjoin_ffi univalue)
     # Upstream's global Tokio runtime has no shutdown API. Isolate each case.
     file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/DiscoverPayjoin-$<CONFIG>.cmake"
       CONTENT "set(PAYJOIN_TEST_EXECUTABLE [==[$<TARGET_FILE:test_payjoin_integration>]==])
