@@ -118,19 +118,34 @@ class InlineCompletionTransport final : public ControlledTransport
 public:
     bool m_complete_on_submit{false};
     bool m_complete_on_cancel{false};
-    Completion m_completion;
+    size_t m_completions{0};
 
     SubmitResult Submit(uint64_t id, SenderRequest request, std::chrono::milliseconds timeout, Completion callback) override
     {
-        m_completion = callback;
-        if (m_complete_on_submit) callback({Delivery::NotSent, {}, "inline submit completion"});
-        return ControlledTransport::Submit(id, std::move(request), timeout, std::move(callback));
+        auto counted = [this, callback = std::move(callback)](TransportResult result) {
+            ++m_completions;
+            callback(std::move(result));
+        };
+        const auto result = ControlledTransport::Submit(id, std::move(request), timeout, std::move(counted));
+        if (result == SubmitResult::Accepted && m_complete_on_submit) {
+            auto complete = std::move(m_pending.back().complete);
+            m_pending.pop_back();
+            complete({Delivery::NotSent, {}, "inline submit completion"});
+        }
+        return result;
     }
 
     void Cancel(uint64_t id) override
     {
         ControlledTransport::Cancel(id);
-        if (m_complete_on_cancel && m_completion) m_completion({Delivery::NotSent, {}, "inline cancel completion"});
+        if (!m_complete_on_cancel) return;
+
+        const auto pending = std::find_if(m_pending.begin(), m_pending.end(), [id](const auto& request) { return request.id == id; });
+        if (pending == m_pending.end()) return;
+
+        auto complete = std::move(pending->complete);
+        m_pending.erase(pending);
+        complete({Delivery::NotSent, {}, "inline cancel completion"});
     }
 };
 
@@ -151,6 +166,8 @@ public:
 
     SubmitResult Submit(uint64_t, SenderRequest, std::chrono::milliseconds, Completion callback) override
     {
+        if (m_stopped) return SubmitResult::Stopped;
+
         m_completion = std::move(callback);
         m_entered.set_value();
         m_release.wait();
@@ -160,12 +177,15 @@ public:
     void Cancel(uint64_t id) override
     {
         ControlledTransport::Cancel(id);
-        if (m_completion) m_completion({Delivery::NotSent, {}, "inline cancel during stop"});
+        if (auto complete = std::exchange(m_completion, {})) complete({Delivery::NotSent, {}, "inline cancel during stop"});
     }
 
     void Stop() override
     {
-        if (m_completion) m_completion({Delivery::NotSent, {}, "late stop completion"});
+        if (m_stopped) return;
+
+        ControlledTransport::Stop();
+        if (auto complete = std::exchange(m_completion, {})) complete({Delivery::NotSent, {}, "stop completion"});
     }
 };
 
@@ -370,7 +390,7 @@ void CheckPreparationWithPendingBlock(SenderFixture& fixture, bool send)
     ValidationQueuePause validation{*fixture.m_node.chain};
     validation.Wait();
     const auto wallet_tip = WITH_LOCK(fixture.m_sender->cs_wallet, return fixture.m_sender->GetLastBlockHash());
-    const auto block = fixture.CreateAndProcessBlock({CMutableTransaction{*spend}}, GetScriptForDestination(WitnessV0KeyHash{fixture.m_receiver_key.GetPubKey()}));
+    const auto block = fixture.CreateAndProcessBlock({CMutableTransaction{*spend}}, GetScriptForDestination(WitnessV0KeyHash{fixture.m_receiver_key.GetPubKey()}), /*sync=*/false);
     BOOST_REQUIRE(WITH_LOCK(cs_main, return fixture.m_node.chainman->ActiveChain().Tip()->GetBlockHash()) == block.GetHash());
     BOOST_REQUIRE(WITH_LOCK(fixture.m_sender->cs_wallet, return fixture.m_sender->GetLastBlockHash()) == wallet_tip);
 
@@ -696,6 +716,7 @@ BOOST_AUTO_TEST_CASE(sender_api_registration_does_not_wait_for_wallet_execution)
     scheduler.m_service_thread = std::thread{[&] { scheduler.serviceQueue(); }};
     const auto id = scheduled->Start(Intent());
     BOOST_REQUIRE(entered.wait_for(std::chrono::seconds{5}) == std::future_status::ready);
+    const auto duplicate_completion = controlled->m_completion;
 
     auto registration = std::async(std::launch::async, [&] {
         std::vector<std::future<ManagerResult>> operations;
@@ -734,7 +755,8 @@ BOOST_AUTO_TEST_CASE(sender_api_registration_does_not_wait_for_wallet_execution)
         BOOST_CHECK(!WITH_LOCK(m_sender->cs_wallet, return m_sender->IsLockedCoin(input.prevout)));
     }
     const auto writes = m_database->WriteCount();
-    controlled->m_completion({Delivery::Response, {1, 2, 3}, "late protocol response"});
+    BOOST_CHECK(!controlled->m_completion);
+    duplicate_completion({Delivery::Response, {1, 2, 3}, "late protocol response"});
     BOOST_CHECK_EQUAL(m_database->WriteCount(), writes);
 }
 
@@ -969,6 +991,9 @@ BOOST_FIXTURE_TEST_CASE(sender_inline_submit_completion_is_deferred, InlineCompl
     BOOST_CHECK(failed_view.issue == PaymentIssue::Delivery);
     BOOST_CHECK_EQUAL(failed_view.diagnostic, "inline submit completion");
     BOOST_CHECK(failed_view.transport_accepted);
+    BOOST_CHECK(m_transport->m_pending.empty());
+    m_service->Stop();
+    BOOST_CHECK_EQUAL(InlineTransport().m_completions, 1);
 }
 
 BOOST_FIXTURE_TEST_CASE(sender_inline_cancel_completion_is_deferred, InlineCompletionFixture)
@@ -985,6 +1010,9 @@ BOOST_FIXTURE_TEST_CASE(sender_inline_cancel_completion_is_deferred, InlineCompl
 
     BOOST_CHECK(m_service->Snapshot(cancelled)->phase == PaymentPhase::Cancelled);
     BOOST_CHECK(!m_service->Snapshot(cancelled)->issue);
+    BOOST_CHECK(m_transport->m_pending.empty());
+    m_service->Stop();
+    BOOST_CHECK_EQUAL(InlineTransport().m_completions, 1);
 }
 
 BOOST_AUTO_TEST_CASE(sender_pending_executor_task_does_not_keep_service_alive)
@@ -1063,6 +1091,7 @@ BOOST_AUTO_TEST_CASE(sender_stop_waits_for_running_dispatch_and_ignores_late_com
 
     const auto id = scheduled->Start(Intent());
     BOOST_REQUIRE(entered.wait_for(std::chrono::seconds{30}) == std::future_status::ready);
+    const auto duplicate_completion = blocking->m_completion;
 
     cleanup.m_stopper = std::thread{[&] {
         scheduled->Stop();
@@ -1077,7 +1106,8 @@ BOOST_AUTO_TEST_CASE(sender_stop_waits_for_running_dispatch_and_ignores_late_com
     BOOST_REQUIRE(stopped.wait_for(std::chrono::seconds{5}) == std::future_status::ready);
     cleanup.m_stopper.join();
 
-    blocking->m_completion({Delivery::NotSent, {}, "completion after stop"});
+    BOOST_CHECK(!blocking->m_completion);
+    duplicate_completion({Delivery::NotSent, {}, "duplicate completion after stop"});
     scheduled->Cancel(id);
     executor.insert([&] { drained.set_value(); });
     BOOST_REQUIRE(completed.wait_for(std::chrono::seconds{5}) == std::future_status::ready);

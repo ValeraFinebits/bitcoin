@@ -20,6 +20,8 @@ class Chain;
 namespace wallet {
 class CWallet;
 namespace payjoin {
+std::unique_ptr<SenderTransport> MakeDirectTransport(interfaces::Chain& chain, const ArgsManager& args);
+
 class SenderManager
 {
 public:
