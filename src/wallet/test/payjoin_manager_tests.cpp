@@ -10,6 +10,8 @@
 #include <net.h>
 #include <netbase.h>
 #include <node/context.h>
+#include <payjoin/client.h>
+#include <payjoin/transport.h>
 #include <policy/feerate.h>
 #include <primitives/block.h>
 #include <primitives/transaction.h>
@@ -190,6 +192,75 @@ BOOST_AUTO_TEST_CASE(manager_rpc_retry_accepts_advertised_actions)
                    error["message"].get_str() == "action must be retry_signing or retry_publication";
         });
     }
+}
+
+BOOST_AUTO_TEST_CASE(manager_transport_stop_closes_admission)
+{
+    auto transport = MakeDirectTransport(*m_node.chain, *m_node.args);
+    const SenderRequest request{"https://relay.example", "application/octet-stream", {}};
+    int callbacks{0};
+    transport->Stop();
+
+    for (const bool network_active : {true, false}) {
+        m_node.connman->SetNetworkActive(network_active);
+        BOOST_CHECK(transport->Submit(1, request, 1s, [&](TransportResult) { ++callbacks; }) == SubmitResult::Stopped);
+    }
+    transport->Stop();
+    BOOST_CHECK_EQUAL(callbacks, 0);
+}
+
+BOOST_AUTO_TEST_CASE(manager_transport_stop_waits_for_inline_completion)
+{
+    auto transport = MakeDirectTransport(*m_node.chain, *m_node.args);
+    const SenderRequest request{"https://relay.example", "application/octet-stream", {}};
+    auto barrier = std::make_shared<Barrier>();
+    auto entered = barrier->m_entered.get_future();
+    std::atomic<int> callbacks{0};
+    std::atomic<int> probe_callbacks{0};
+    int nested_callbacks{0};
+    SubmitResult nested_result{SubmitResult::InvalidRequest};
+    Delivery delivery{Delivery::Uncertain};
+    bool inline_completion{false};
+    std::future<SubmitResult> submission;
+    std::future<void> stopped;
+    ReleaseOnExit release{barrier};
+
+    m_node.connman->SetNetworkActive(false);
+    submission = std::async(std::launch::async, [&] {
+        const auto submitter = std::this_thread::get_id();
+        return transport->Submit(1, request, 1s, [&](TransportResult result) {
+            ++callbacks;
+            delivery = result.delivery;
+            inline_completion = std::this_thread::get_id() == submitter;
+            nested_result = transport->Submit(2, request, 1s, [&](TransportResult) { ++nested_callbacks; });
+            barrier->Pause();
+        });
+    });
+    Await(std::move(entered));
+    stopped = std::async(std::launch::async, [&] { transport->Stop(); });
+
+    SubmitResult after_stop{SubmitResult::Accepted};
+    const auto deadline = std::chrono::steady_clock::now() + 10s;
+    do {
+        after_stop = transport->Submit(3, request, 1s, [&](TransportResult) { ++probe_callbacks; });
+        if (after_stop == SubmitResult::Stopped) break;
+        std::this_thread::yield();
+    } while (std::chrono::steady_clock::now() < deadline);
+    BOOST_REQUIRE(after_stop == SubmitResult::Stopped);
+    BOOST_CHECK(stopped.wait_for(100ms) == std::future_status::timeout);
+
+    barrier->Open();
+    BOOST_CHECK(Await(std::move(submission)) == SubmitResult::Accepted);
+    Await(std::move(stopped));
+    BOOST_CHECK(inline_completion);
+    BOOST_CHECK(delivery == Delivery::NotSent);
+    BOOST_CHECK_EQUAL(callbacks.load(), 1);
+    BOOST_CHECK(nested_result == SubmitResult::Accepted);
+    BOOST_CHECK_EQUAL(nested_callbacks, 1);
+
+    const auto before = probe_callbacks.load();
+    BOOST_CHECK(transport->Submit(4, request, 1s, [&](TransportResult) { ++probe_callbacks; }) == SubmitResult::Stopped);
+    BOOST_CHECK_EQUAL(probe_callbacks.load(), before);
 }
 
 BOOST_AUTO_TEST_CASE(manager_preaccept_failure_does_not_claim_request_id)

@@ -18,6 +18,8 @@
 #include <wallet/payjoin/sender.h>
 
 #include <chrono>
+#include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <future>
@@ -55,12 +57,33 @@ class DirectTransport final : public SenderTransport
     interfaces::Chain& m_chain;
     const ArgsManager& m_args;
     HttpSenderTransport m_http;
+    Mutex m_mutex;
+    std::condition_variable m_idle;
+    bool m_stopped GUARDED_BY(m_mutex){false};
+    size_t m_submissions GUARDED_BY(m_mutex){0};
 
 public:
     explicit DirectTransport(interfaces::Chain& chain, const ArgsManager& args) : m_chain{chain}, m_args{args} {}
 
-    SubmitResult Submit(uint64_t id, SenderRequest request, std::chrono::milliseconds timeout, Completion completion) override
+    ~DirectTransport() override { Stop(); }
+
+    SubmitResult Submit(uint64_t id, SenderRequest request, std::chrono::milliseconds timeout, Completion completion) override EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)
     {
+        {
+            LOCK(m_mutex);
+            if (m_stopped) return SubmitResult::Stopped;
+            ++m_submissions;
+        }
+        struct Submission {
+            DirectTransport& transport;
+            ~Submission()
+            {
+                LOCK(transport.m_mutex);
+                --transport.m_submissions;
+                transport.m_idle.notify_all();
+            }
+        } submission{*this};
+
         if (auto error = DirectNetworkError(m_chain, m_args)) {
             completion({Delivery::NotSent, {}, std::move(*error), false});
             return SubmitResult::Accepted;
@@ -71,7 +94,15 @@ public:
 
     void Cancel(uint64_t id) override { m_http.Cancel(id); }
 
-    void Stop() override { m_http.Stop(); }
+    void Stop() override EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)
+    {
+        {
+            WAIT_LOCK(m_mutex, lock);
+            m_stopped = true;
+            m_idle.wait(lock, [this]() EXCLUSIVE_LOCKS_REQUIRED(m_mutex) { return m_submissions == 0; });
+        }
+        m_http.Stop();
+    }
 };
 
 std::future<ManagerResult> Ready(ManagerResult result)
@@ -82,6 +113,11 @@ std::future<ManagerResult> Ready(ManagerResult result)
     return future;
 }
 } // namespace
+
+std::unique_ptr<SenderTransport> MakeDirectTransport(interfaces::Chain& chain, const ArgsManager& args)
+{
+    return std::make_unique<DirectTransport>(chain, args);
+}
 
 struct SenderManager::State {
     struct Entry {
@@ -155,7 +191,7 @@ struct SenderManager::State {
         if (entry.closing || m_stopped) return {{}, StoppedView(entry, id)};
         if (!create) return {{}, {id ? CommandStatus::NotFound : CommandStatus::Completed}};
 
-        auto transport = [this] { return std::make_unique<DirectTransport>(m_chain, m_args); };
+        auto transport = [this] { return MakeDirectTransport(m_chain, m_args); };
         auto schedule = [this](std::chrono::milliseconds delay, std::function<void()> work) {
             m_scheduler.scheduleFromNow(std::move(work), delay);
         };
