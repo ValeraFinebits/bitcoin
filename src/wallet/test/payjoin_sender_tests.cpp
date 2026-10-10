@@ -390,7 +390,7 @@ void CheckPreparationWithPendingBlock(SenderFixture& fixture, bool send)
     ValidationQueuePause validation{*fixture.m_node.chain};
     validation.Wait();
     const auto wallet_tip = WITH_LOCK(fixture.m_sender->cs_wallet, return fixture.m_sender->GetLastBlockHash());
-    const auto block = fixture.CreateAndProcessBlock({CMutableTransaction{*spend}}, GetScriptForDestination(WitnessV0KeyHash{fixture.m_receiver_key.GetPubKey()}));
+    const auto block = fixture.CreateAndProcessBlock({CMutableTransaction{*spend}}, GetScriptForDestination(WitnessV0KeyHash{fixture.m_receiver_key.GetPubKey()}), /*sync=*/false);
     BOOST_REQUIRE(WITH_LOCK(cs_main, return fixture.m_node.chainman->ActiveChain().Tip()->GetBlockHash()) == block.GetHash());
     BOOST_REQUIRE(WITH_LOCK(fixture.m_sender->cs_wallet, return fixture.m_sender->GetLastBlockHash()) == wallet_tip);
 
