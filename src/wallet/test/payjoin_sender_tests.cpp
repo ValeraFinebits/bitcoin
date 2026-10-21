@@ -259,8 +259,11 @@ class StopLockProbe
 public:
     StopLockProbe()
     {
+        auto levels = m_levels;
+        levels.insert_or_assign(BCLog::LOCK, BCLog::Level::Debug);
+
         LogInstance().EnableCategory(BCLog::LOCK);
-        LogInstance().AddCategoryLogLevel(BCLog::LOCK, BCLog::Level::Debug);
+        LogInstance().SetCategoryLogLevel(levels);
     }
 
     ~StopLockProbe()
