@@ -118,7 +118,12 @@ struct Record {
     std::vector<unsigned char> selected;
     bool exposed{false};
     bool released{false};
-    SERIALIZE_METHODS(Record, obj) { READWRITE(obj.uri, obj.original, obj.selected, obj.exposed, obj.released); }
+
+    template <typename Stream>
+    void Serialize(Stream& s) const
+    {
+        ::SerializeMany(s, uri, original, selected, exposed, released);
+    }
 };
 
 struct JournalRecord {
