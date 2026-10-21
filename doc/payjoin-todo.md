@@ -56,4 +56,4 @@ reproducible builds with C++ and Rust instrumentation; completion: passing jobs 
 ## Async v2 receiver
 
 Build a production async wallet service, adapter and RPC around
-[receiver FFI](../payjoin/payjoin-ffi/src/receive/mod.rs#L538), currently used in Core tests.
+[receiver FFI](https://github.com/payjoin/rust-payjoin/blob/f99b3031696e7f54e609615b8df6d91b29fb6f75/payjoin-ffi/src/receive/mod.rs#L538), currently used in Core tests.
