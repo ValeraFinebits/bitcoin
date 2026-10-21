@@ -16,12 +16,18 @@
 
 namespace wallet::payjoin {
 struct HttpTransportOptions {
+    /** PEM CA bundle; empty uses libcurl's configured trust store. TLS verification remains enabled. */
     std::string ca_file;
+    /** Explicit libcurl proxy; empty disables environment proxies. Core proxy settings are not used. */
     std::string proxy;
     size_t max_response_bytes{1024 * 1024};
+    /** Maximum number of queued and active requests. Both limits must be nonzero. */
     size_t max_requests{32};
 };
 
+/** HTTP(S) POST transport with TLS verification, no redirects, and one worker for completions.
+ * MakeDirectTransport() separately enforces wallet network policy.
+ */
 class HttpSenderTransport final : public SenderTransport
 {
 public:
