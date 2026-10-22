@@ -353,7 +353,7 @@ BOOST_AUTO_TEST_CASE(manager_rechecks_network_policy_before_http_handoff)
     BOOST_CHECK(payment.issue == PaymentIssue::Delivery);
     BOOST_CHECK(!payment.possibly_exposed);
     BOOST_CHECK(!payment.storage_uncertain);
-    BOOST_CHECK(payment.owns_inputs);
+    BOOST_CHECK(payment.has_unreleased_reservation);
     BOOST_CHECK(!ReadStoredPayment(id).exposed);
 
     const auto cancelled = Await(m_manager.Execute(m_loaded, id, SenderCommand::Cancel));
@@ -565,7 +565,7 @@ BOOST_AUTO_TEST_CASE(manager_remove_wallet_releases_managed_wallet)
     const auto prepared = Await(context.payjoin->Read(wallet, id));
     BOOST_REQUIRE_EQUAL(prepared.payments.size(), 1);
     BOOST_REQUIRE(prepared.payments.front().payment.original);
-    BOOST_REQUIRE(prepared.payments.front().payment.owns_inputs);
+    BOOST_REQUIRE(prepared.payments.front().payment.has_unreleased_reservation);
     std::weak_ptr<CWallet> released = wallet;
 
     BOOST_REQUIRE(RemoveWallet(context, wallet, std::nullopt));
@@ -723,7 +723,7 @@ BOOST_AUTO_TEST_CASE(manager_preparation_barrier_does_not_delay_stop_or_touch_de
     BOOST_REQUIRE_EQUAL(archived.payments.size(), 1);
     BOOST_CHECK(archived.payments.front().payment.phase == PaymentPhase::Stopped);
     BOOST_CHECK(!archived.payments.front().payment.original);
-    BOOST_CHECK(!archived.payments.front().payment.owns_inputs);
+    BOOST_CHECK(!archived.payments.front().payment.has_unreleased_reservation);
 
     barrier->Open();
     m_node.validation_signals->SyncWithValidationInterfaceQueue();
@@ -753,7 +753,7 @@ BOOST_AUTO_TEST_CASE(manager_read_barrier_does_not_delay_stop_or_touch_destroyed
     BOOST_CHECK(final.status == CommandStatus::Stopped);
     BOOST_REQUIRE_EQUAL(final.payments.size(), 1);
     BOOST_CHECK(final.payments.front().payment.phase == PaymentPhase::Stopped);
-    BOOST_CHECK(!final.payments.front().payment.owns_inputs);
+    BOOST_CHECK(!final.payments.front().payment.has_unreleased_reservation);
     BOOST_CHECK(ReadStoredPayment(id).released);
     BOOST_CHECK_EQUAL(m_loaded.use_count(), 1);
     const auto writes = m_database->WriteCount();
@@ -765,7 +765,7 @@ BOOST_AUTO_TEST_CASE(manager_read_barrier_does_not_delay_stop_or_touch_destroyed
     BOOST_CHECK(archived.status == CommandStatus::Stopped);
     BOOST_REQUIRE_EQUAL(archived.payments.size(), 1);
     BOOST_CHECK(archived.payments.front().payment.original->Equals(*final.payments.front().payment.original));
-    BOOST_CHECK(!archived.payments.front().payment.owns_inputs);
+    BOOST_CHECK(!archived.payments.front().payment.has_unreleased_reservation);
 }
 
 BOOST_AUTO_TEST_CASE(manager_read_accounts_for_mempool_changes_without_external_barrier)
@@ -791,7 +791,7 @@ BOOST_AUTO_TEST_CASE(manager_read_accounts_for_mempool_changes_without_external_
     BOOST_REQUIRE_EQUAL(read.payments.size(), 1);
     BOOST_CHECK(read.payments.front().payment.selected_presence == TransactionPresence::Inactive);
     BOOST_CHECK(read.payments.front().payment.node_accepted);
-    BOOST_CHECK(read.payments.front().payment.owns_inputs);
+    BOOST_CHECK(read.payments.front().payment.has_unreleased_reservation);
     BOOST_CHECK(!read.payments.front().payment.settlement);
     BOOST_CHECK(!m_node.mempool->exists(selected->GetHash()));
     BOOST_CHECK(!ReadStoredPayment(id).released);
