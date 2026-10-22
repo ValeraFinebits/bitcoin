@@ -191,7 +191,8 @@ fi
 if [ "${RUN_PAYJOIN_INTEGRATION_TESTS:-false}" = "true" ]; then
   integration_build="${BASE_ROOT_DIR}/build-payjoin-integration"
   cmake -S "${BASE_ROOT_DIR}" -B "${integration_build}" \
-    "${CMAKE_ARGS[@]}" \
+    "${BITCOIN_CONFIG_ALL[@]}" \
+    "${BITCOIN_CONFIG[@]}" \
     -DENABLE_PAYJOIN=ON \
     -DBUILD_TESTS=ON \
     -DBUILD_PAYJOIN_INTEGRATION_TESTS=ON \
