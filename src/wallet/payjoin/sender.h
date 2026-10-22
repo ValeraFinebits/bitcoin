@@ -99,7 +99,7 @@ struct PaymentSnapshot {
     CTransactionRef selected;
 
     bool original_saved{false};
-    bool owns_inputs{false};
+    bool has_unreleased_reservation{false};
 
     /** Verification of current in-memory wallet locks, not their database persistence. */
     bool locks_verified{false};

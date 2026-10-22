@@ -326,7 +326,8 @@ struct IntegrationFixture : SenderFixture {
     }
 
     auto BuildProposal(const std::shared_ptr<::payjoin::UncheckedOriginalPayload>& unchecked,
-                       std::function<void(PartiallySignedTransaction&)> modify_psbt = {})
+                       std::function<void(PartiallySignedTransaction&)> modify_psbt = {},
+                       std::optional<uint64_t> expected_input_weight = std::nullopt)
     {
         auto owned = unchecked->check_broadcast_suitability(std::nullopt, std::make_shared<BroadcastCheck>(*m_node.chainman))->save(m_log);
         auto seen = owned->check_inputs_not_owned(std::make_shared<InputNotOwned>(*m_receiver))->save(m_log);
@@ -338,7 +339,9 @@ struct IntegrationFixture : SenderFixture {
         const auto& utxo = coin->vout[0];
         ::payjoin::TxIn input{std::make_shared<::payjoin::OutPoint>(::payjoin::OutPoint{coin->GetHash().ToString(), 0}), {}, 0xfffffffe, {}};
         ::payjoin::PsbtInput psbt_input{std::make_shared<::payjoin::TxOut>(::payjoin::TxOut{static_cast<uint64_t>(utxo.nValue), {utxo.scriptPubKey.begin(), utxo.scriptPubKey.end()}}), std::nullopt, std::nullopt};
-        auto fees = inputs->contribute_inputs({::payjoin::InputPair::init(input, psbt_input, std::nullopt)})->commit_inputs()->save(m_log);
+        std::optional<std::shared_ptr<::payjoin::Weight>> weight;
+        if (expected_input_weight) weight = std::make_shared<::payjoin::Weight>(::payjoin::Weight{*expected_input_weight});
+        auto fees = inputs->contribute_inputs({::payjoin::InputPair::init(input, psbt_input, weight)})->commit_inputs()->save(m_log);
         auto provisional = fees->apply_fee_range(1, 10)->save(m_log);
 
         auto signer = std::make_shared<ReceiverSign>(m_receiver_input_override ? *m_sender : *m_receiver, bool(m_receiver_input_override));
@@ -402,7 +405,7 @@ struct AsyncIntegrationFixture : IntegrationFixture {
         BOOST_CHECK(view.original_saved);
         BOOST_CHECK(view.disclosure_saved);
         BOOST_CHECK(view.possibly_exposed);
-        BOOST_CHECK(view.owns_inputs);
+        BOOST_CHECK(view.has_unreleased_reservation);
 
         LOCK(m_sender->cs_wallet);
         const auto stored = ReadStoredPayment(id);
@@ -412,6 +415,176 @@ struct AsyncIntegrationFixture : IntegrationFixture {
         CheckOwnedInputs(id, *view.original);
     }
 };
+
+CAmount ProposalInputValue(const PartiallySignedTransaction& proposal)
+{
+    CAmount total{0};
+    for (const auto& input : proposal.inputs) {
+        CTxOut utxo;
+        BOOST_REQUIRE(input.GetUTXO(utxo));
+        total += utxo.nValue;
+    }
+    return total;
+}
+
+CTransactionRef SignProposalCopy(IntegrationFixture& fixture, PartiallySignedTransaction proposal)
+{
+    bool complete{false};
+    {
+        LOCK(fixture.m_receiver->cs_wallet);
+        BOOST_REQUIRE(!fixture.m_receiver->FillPSBT(proposal, {}, complete));
+    }
+    {
+        LOCK(fixture.m_sender->cs_wallet);
+        BOOST_REQUIRE(!fixture.m_sender->FillPSBT(proposal, {}, complete));
+    }
+    BOOST_REQUIRE(complete);
+    CMutableTransaction tx;
+    BOOST_REQUIRE(FinalizeAndExtractPSBT(proposal, tx));
+    for (size_t i = 0; i < proposal.inputs.size(); ++i) {
+        CTxOut utxo;
+        BOOST_REQUIRE(proposal.inputs[i].GetUTXO(utxo));
+        BOOST_REQUIRE(VerifyScript(tx.vin[i].scriptSig, utxo.scriptPubKey, &tx.vin[i].scriptWitness,
+                                   STANDARD_SCRIPT_VERIFY_FLAGS,
+                                   MutableTransactionSignatureChecker{&tx, static_cast<unsigned int>(i), utxo.nValue, MissingDataBehavior::FAIL}));
+    }
+    return MakeTransactionRef(std::move(tx));
+}
+
+void CheckFinalProposalFeeRate(IntegrationFixture& fixture, bool sufficient)
+{
+    const auto receiver_script = GetScriptForDestination(WitnessV0ScriptHash{GetScriptForRawPubKey(fixture.m_receiver_key.GetPubKey())});
+    CMutableTransaction funding;
+    funding.vin.emplace_back(COutPoint{fixture.m_receiver_coin->GetHash(), 0});
+    funding.vout.emplace_back(fixture.m_receiver_coin->vout[0].nValue - 1000, receiver_script);
+    PartiallySignedTransaction funding_psbt{funding};
+    bool complete{false};
+    {
+        LOCK(fixture.m_receiver->cs_wallet);
+        CreateDescriptor(*fixture.m_receiver, "wsh(pk(" + EncodeSecret(fixture.m_receiver_key) + "))", true);
+        BOOST_REQUIRE(!fixture.m_receiver->FillPSBT(funding_psbt, {}, complete));
+    }
+    BOOST_REQUIRE(complete);
+    BOOST_REQUIRE(FinalizeAndExtractPSBT(funding_psbt, funding));
+    fixture.m_receiver_coin = MakeTransactionRef(std::move(funding));
+    const auto block = fixture.Confirm(fixture.m_receiver_coin);
+    {
+        LOCK(fixture.m_receiver->cs_wallet);
+        const int height = WITH_LOCK(cs_main, return fixture.m_node.chainman->ActiveChain().Height());
+        BOOST_REQUIRE(fixture.m_receiver->AddToWallet(fixture.m_receiver_coin, TxStateConfirmed{block.GetHash(), height, 1}));
+        fixture.m_receiver->SetLastBlockProcessed(height, block.GetHash());
+    }
+
+    const auto intent = fixture.Intent();
+    const auto id = fixture.m_service->Start(intent);
+    fixture.Flush();
+    const auto original = fixture.m_service->Snapshot(id)->original;
+    BOOST_REQUIRE(original);
+    CAmount original_input_value{0};
+    {
+        LOCK(fixture.m_sender->cs_wallet);
+        for (const auto& input : original->vin) {
+            const auto* parent = fixture.m_sender->GetWalletTx(input.prevout.hash);
+            BOOST_REQUIRE(parent);
+            original_input_value += parent->GetTx()->vout.at(input.prevout.n).nValue;
+        }
+    }
+    const CAmount original_fee = original_input_value - original->GetValueOut();
+    BOOST_REQUIRE_GE(original_fee, intent.fee_rate.GetFee(GetVirtualTransactionSize(*original)));
+    fixture.Deliver();
+
+    const auto unchecked = fixture.ReceiverOriginal();
+    const auto history = std::make_shared<ReceiverLog>(*fixture.m_log);
+    auto [receiver_proposal, proposal] = fixture.BuildProposal(unchecked, {}, MAX_STANDARD_TX_WEIGHT);
+    const auto reference = SignProposalCopy(fixture, proposal);
+
+    auto partial_tx = proposal.GetUnsignedTx();
+    BOOST_REQUIRE(partial_tx);
+    for (size_t i = 0; i < proposal.inputs.size(); ++i) {
+        partial_tx->vin[i].scriptSig = proposal.inputs[i].final_script_sig;
+        partial_tx->vin[i].scriptWitness = proposal.inputs[i].final_script_witness;
+    }
+    const CAmount partial_minimum = intent.fee_rate.GetFee(GetVirtualTransactionSize(CTransaction{*partial_tx}));
+    const CAmount final_minimum = intent.fee_rate.GetFee(GetVirtualTransactionSize(*reference));
+    BOOST_REQUIRE_LT(partial_minimum, final_minimum);
+    const CAmount target_fee = sufficient ? final_minimum + intent.fee_rate.GetFee(1) : (partial_minimum + final_minimum) / 2;
+    BOOST_REQUIRE_GE(target_fee, original_fee);
+
+    uint64_t lower{1}, upper{MAX_STANDARD_TX_WEIGHT};
+    while (lower <= upper) {
+        const uint64_t estimate = lower + (upper - lower) / 2;
+        fixture.m_log = std::make_shared<ReceiverLog>(*history);
+        auto next = fixture.BuildProposal(unchecked, {}, estimate);
+        receiver_proposal = std::move(next.first);
+        proposal = std::move(next.second);
+        const CAmount fee = ProposalInputValue(proposal) - CTransaction{*proposal.GetUnsignedTx()}.GetValueOut();
+        if (fee == target_fee) break;
+        if (fee < target_fee) {
+            lower = estimate + 1;
+        } else {
+            upper = estimate - 1;
+        }
+    }
+
+    const auto candidate = SignProposalCopy(fixture, proposal);
+    const CAmount fee = ProposalInputValue(proposal) - candidate->GetValueOut();
+    BOOST_REQUIRE_EQUAL(fee, target_fee);
+    BOOST_REQUIRE_LE(fee, intent.max_fee);
+    BOOST_REQUIRE_EQUAL(fee >= intent.fee_rate.GetFee(GetVirtualTransactionSize(*candidate)), sufficient);
+    auto post = receiver_proposal->create_post_request(fixture.m_relay);
+    auto response = Post(fixture.m_receiver_http, {post.request->url, post.request->content_type, post.request->body});
+    BOOST_REQUIRE_MESSAGE(response.delivery == Delivery::Response, response.diagnostic);
+    BOOST_REQUIRE(receiver_proposal->process_response(response.body, post.client_response)->save(fixture.m_log));
+    fixture.Tick();
+    fixture.Deliver();
+
+    const auto journal = fixture.Journal(id);
+    BOOST_REQUIRE(journal.second);
+    BOOST_REQUIRE_EQUAL(CountEvent(journal.first, "Closed"), 1);
+    UniValue closed;
+    BOOST_REQUIRE(closed.read(journal.first.back()));
+    BOOST_REQUIRE(closed["Closed"].isObject());
+    BOOST_REQUIRE(closed["Closed"]["Success"].isObject());
+
+    const auto view = *fixture.m_service->Snapshot(id);
+    BOOST_CHECK(!view.storage_uncertain);
+    BOOST_CHECK(view.has_unreleased_reservation);
+    if (sufficient) {
+        BOOST_REQUIRE_MESSAGE(view.node_accepted, view.diagnostic);
+        BOOST_REQUIRE(view.selected);
+        BOOST_CHECK(view.selected->GetHash() == candidate->GetHash());
+        BOOST_CHECK_GE(ProposalInputValue(proposal) - view.selected->GetValueOut(),
+                       intent.fee_rate.GetFee(GetVirtualTransactionSize(*view.selected)));
+        BOOST_CHECK(fixture.m_node.mempool->exists(view.selected->GetHash()));
+        return;
+    }
+
+    BOOST_CHECK(view.issue == PaymentIssue::Signing);
+    BOOST_CHECK_EQUAL(view.diagnostic, "final proposal fee rate is below payment policy");
+    BOOST_CHECK(!view.selected);
+    BOOST_CHECK(!view.selection_saved);
+    BOOST_CHECK(!view.wallet_recorded);
+    BOOST_CHECK(!view.node_accepted);
+    BOOST_CHECK(view.fallback_available);
+    BOOST_CHECK(fixture.ReadStoredPayment(id).selected.empty());
+    BOOST_CHECK(!fixture.ReadStoredPayment(id).released);
+    BOOST_CHECK(!fixture.m_node.mempool->exists(candidate->GetHash()));
+    BOOST_CHECK(!fixture.m_node.mempool->exists(original->GetHash()));
+    {
+        LOCK(fixture.m_sender->cs_wallet);
+        BOOST_CHECK(!fixture.m_sender->mapWallet.contains(candidate->GetHash()));
+        BOOST_CHECK(!fixture.m_sender->mapWallet.contains(original->GetHash()));
+        fixture.CheckOwnedInputs(id, *original);
+    }
+
+    fixture.m_service->PublishFallback(id);
+    fixture.Flush();
+    const auto fallback = *fixture.m_service->Snapshot(id);
+    BOOST_REQUIRE_MESSAGE(fallback.node_accepted, fallback.diagnostic);
+    BOOST_REQUIRE(fallback.selected);
+    BOOST_CHECK(fallback.selected->Equals(*original));
+    BOOST_CHECK(fixture.m_node.mempool->exists(original->GetHash()));
+}
 
 enum class UtxoFields {
     WitnessOnly,
@@ -571,7 +744,7 @@ void CheckReceiverUtxoFields(IntegrationFixture& fixture, UtxoFields fields)
 
         BOOST_CHECK(fixture.m_node.mempool->exists(view.selected->GetHash()));
     }
-    BOOST_CHECK(view.owns_inputs);
+    BOOST_CHECK(view.has_unreleased_reservation);
 }
 
 void CheckQueuedProposal(IntegrationFixture& fixture, bool cancel)
@@ -620,13 +793,13 @@ void CheckQueuedProposal(IntegrationFixture& fixture, bool cancel)
     BOOST_REQUIRE(after_cancel->phase == PaymentPhase::Cancelled);
     BOOST_REQUIRE(!after_cancel->selected);
     BOOST_REQUIRE(after_cancel->possibly_exposed);
-    BOOST_REQUIRE(after_cancel->owns_inputs);
+    BOOST_REQUIRE(after_cancel->has_unreleased_reservation);
 
     const auto view = *fixture.m_service->Snapshot(id);
     BOOST_CHECK(view.phase == after_cancel->phase);
     BOOST_CHECK(!view.selected);
     BOOST_CHECK(view.possibly_exposed == after_cancel->possibly_exposed);
-    BOOST_CHECK(view.owns_inputs == after_cancel->owns_inputs);
+    BOOST_CHECK(view.has_unreleased_reservation == after_cancel->has_unreleased_reservation);
     BOOST_CHECK(view.issue == after_cancel->issue);
     BOOST_CHECK_EQUAL(view.diagnostic, after_cancel->diagnostic);
 
@@ -693,7 +866,7 @@ void CheckProposalDeadline(IntegrationFixture& fixture, std::chrono::millisecond
         BOOST_CHECK(!fixture.m_sender->mapWallet.contains(view.original->GetHash()));
         fixture.CheckOwnedInputs(id, *view.original);
     }
-    BOOST_CHECK(view.owns_inputs);
+    BOOST_CHECK(view.has_unreleased_reservation);
     BOOST_CHECK(view.possibly_exposed);
 
     BOOST_CHECK(!fixture.m_node.mempool->exists(view.original->GetHash()));
@@ -845,7 +1018,7 @@ BOOST_FIXTURE_TEST_CASE(sender_retry_signing_after_network_deadline, Integration
     BOOST_REQUIRE(unsigned_view.issue == PaymentIssue::Signing);
     BOOST_CHECK_EQUAL(unsigned_view.diagnostic, "Payjoin requires an unlocked wallet with local private keys");
     BOOST_REQUIRE(!unsigned_view.selected);
-    BOOST_CHECK(unsigned_view.owns_inputs);
+    BOOST_CHECK(unsigned_view.has_unreleased_reservation);
 
     m_now = SenderService::Clock::time_point{} + intent.timeout + std::chrono::milliseconds{1};
     while (!m_timers.empty() && m_timers.begin()->first <= m_now) {
@@ -937,7 +1110,7 @@ BOOST_FIXTURE_TEST_CASE(sender_signs_receiver_proposal_and_publishes, Integratio
         BOOST_REQUIRE(prepared.original);
         BOOST_CHECK(prepared.original->HasWitness());
         BOOST_CHECK(prepared.original_saved);
-        BOOST_CHECK(prepared.owns_inputs);
+        BOOST_CHECK(prepared.has_unreleased_reservation);
         BOOST_CHECK(prepared.locks_verified);
         BOOST_CHECK(!prepared.possibly_exposed);
         BOOST_CHECK(m_transport->m_pending.empty());
@@ -953,7 +1126,7 @@ BOOST_FIXTURE_TEST_CASE(sender_signs_receiver_proposal_and_publishes, Integratio
     m_transport->m_on_dispatch = [&] {
         const auto view = *m_service->Snapshot(id);
         BOOST_CHECK(view.original_saved);
-        BOOST_CHECK(view.owns_inputs);
+        BOOST_CHECK(view.has_unreleased_reservation);
         BOOST_CHECK(view.locks_verified);
         BOOST_CHECK(view.possibly_exposed);
         BOOST_CHECK(view.disclosure_saved);
@@ -1034,7 +1207,7 @@ BOOST_FIXTURE_TEST_CASE(sender_lost_initial_response_requires_attention, Integra
     const auto view = *m_service->Snapshot(id);
     BOOST_CHECK(view.issue == PaymentIssue::Delivery);
     BOOST_CHECK(view.possibly_exposed);
-    BOOST_CHECK(view.owns_inputs);
+    BOOST_CHECK(view.has_unreleased_reservation);
     BOOST_CHECK(!view.selected);
 
     Tick();
@@ -1122,7 +1295,7 @@ BOOST_FIXTURE_TEST_CASE(sender_poll_trusts_persistent_memory_lock, IntegrationFi
 
     const auto view = *m_service->Snapshot(id);
     BOOST_CHECK(!view.issue);
-    BOOST_CHECK(view.owns_inputs);
+    BOOST_CHECK(view.has_unreleased_reservation);
     BOOST_CHECK(view.locks_verified);
     BOOST_CHECK(view.transport_accepted);
     BOOST_CHECK(!view.selected);
@@ -1183,7 +1356,7 @@ BOOST_FIXTURE_TEST_CASE(sender_manual_unlock_blocks_publication_without_releasin
 
     Tick();
     BOOST_CHECK(m_service->Snapshot(id)->issue == PaymentIssue::Reservation);
-    BOOST_CHECK(m_service->Snapshot(id)->owns_inputs);
+    BOOST_CHECK(m_service->Snapshot(id)->has_unreleased_reservation);
     BOOST_CHECK(!m_service->Snapshot(id)->selected);
 
     const auto other = m_service->Start(Intent());
@@ -1243,7 +1416,7 @@ BOOST_FIXTURE_TEST_CASE(sender_mempool_fallback_ignores_late_proposal, Integrati
     BOOST_CHECK(after.selected->GetWitnessHash() == original->GetWitnessHash());
     BOOST_CHECK(after.phase == PaymentPhase::Published);
     BOOST_CHECK(after.node_accepted);
-    BOOST_CHECK(after.owns_inputs);
+    BOOST_CHECK(after.has_unreleased_reservation);
     BOOST_CHECK(!after.issue);
     BOOST_CHECK(after.diagnostic.empty());
 
@@ -1289,7 +1462,7 @@ BOOST_FIXTURE_TEST_CASE(sender_signing_failure_allows_explicit_choice_or_retry, 
     BOOST_CHECK(m_service->Snapshot(id)->issue == PaymentIssue::Signing);
     BOOST_CHECK(!m_service->Snapshot(id)->selected);
     BOOST_CHECK(m_service->Snapshot(id)->fallback_available);
-    BOOST_CHECK(m_service->Snapshot(id)->owns_inputs);
+    BOOST_CHECK(m_service->Snapshot(id)->has_unreleased_reservation);
 
     m_service->RetrySigning(id);
     Flush();
@@ -1400,7 +1573,7 @@ BOOST_FIXTURE_TEST_CASE(sender_publication_retry_and_confirmed_cleanup, Integrat
     Flush();
 
     BOOST_CHECK(m_service->Snapshot(id)->phase == PaymentPhase::Confirmed);
-    BOOST_CHECK(!m_service->Snapshot(id)->owns_inputs);
+    BOOST_CHECK(!m_service->Snapshot(id)->has_unreleased_reservation);
 
     m_service->RetryPublication(id);
     Flush();
@@ -1419,7 +1592,7 @@ BOOST_FIXTURE_TEST_CASE(sender_publication_retry_and_confirmed_cleanup, Integrat
         const auto view = *m_service->Snapshot(id);
         BOOST_CHECK(!view.settlement);
         BOOST_CHECK(view.phase == PaymentPhase::Attention);
-        BOOST_CHECK(!view.owns_inputs);
+        BOOST_CHECK(!view.has_unreleased_reservation);
         BOOST_CHECK(view.selected_presence == TransactionPresence::Inactive);
     }
 
@@ -1449,7 +1622,7 @@ BOOST_FIXTURE_TEST_CASE(sender_selection_write_failure_forbids_publication, Inte
     BOOST_CHECK(!view.wallet_recorded);
     BOOST_CHECK(!view.node_accepted);
     BOOST_CHECK(!view.fallback_available);
-    BOOST_CHECK(view.owns_inputs);
+    BOOST_CHECK(view.has_unreleased_reservation);
 
     m_service->PublishFallback(id);
     Flush();
@@ -1521,7 +1694,7 @@ BOOST_FIXTURE_TEST_CASE(sender_original_settles_after_proposal_selection, Integr
     BOOST_REQUIRE(view.settlement);
     BOOST_CHECK(view.settlement->kind == SpendKind::Original);
     BOOST_CHECK(view.selected->GetWitnessHash() == selected->GetWitnessHash());
-    BOOST_CHECK(!view.owns_inputs);
+    BOOST_CHECK(!view.has_unreleased_reservation);
 }
 
 BOOST_FIXTURE_TEST_CASE(sender_wallet_change_before_signing_wins, IntegrationFixture)
@@ -1557,6 +1730,16 @@ BOOST_FIXTURE_TEST_CASE(sender_wallet_change_before_signing_wins, IntegrationFix
     const auto signing_result = signing_future.get();
     BOOST_CHECK(signing_result.refusal == CommandRefusal::InputsChanged);
     BOOST_CHECK(!m_service->Snapshot(id)->selected);
+}
+
+BOOST_FIXTURE_TEST_CASE(sender_rejects_insufficient_final_fee_rate, IntegrationFixture)
+{
+    CheckFinalProposalFeeRate(*this, false);
+}
+
+BOOST_FIXTURE_TEST_CASE(sender_accepts_sufficient_final_fee_rate, IntegrationFixture)
+{
+    CheckFinalProposalFeeRate(*this, true);
 }
 
 BOOST_FIXTURE_TEST_CASE(sender_total_fee_policy_boundary, IntegrationFixture)
@@ -1758,7 +1941,7 @@ BOOST_FIXTURE_TEST_CASE(sender_poll_checks_only_original_reservations, Integrati
     BOOST_CHECK(refused.issue == PaymentIssue::Reservation);
     BOOST_CHECK_EQUAL(refused.diagnostic, "payment inputs changed; reconciliation required");
     BOOST_CHECK(!refused.locks_verified);
-    BOOST_CHECK(refused.owns_inputs);
+    BOOST_CHECK(refused.has_unreleased_reservation);
     BOOST_CHECK(!refused.selected);
     BOOST_CHECK(!refused.node_accepted);
     BOOST_CHECK_EQUAL(m_transport->m_attempts, attempts);
@@ -1904,7 +2087,7 @@ BOOST_FIXTURE_TEST_CASE(sender_poll_retryable_not_sent_and_terminal_delivery, In
     BOOST_CHECK(published.node_accepted);
     BOOST_CHECK(!published.issue);
     BOOST_CHECK(published.diagnostic.empty());
-    BOOST_CHECK(published.owns_inputs);
+    BOOST_CHECK(published.has_unreleased_reservation);
     const auto journal = Journal(id);
     BOOST_CHECK(journal.second);
 
@@ -1954,14 +2137,14 @@ BOOST_FIXTURE_TEST_CASE(sender_not_sent_poll_preserves_previous_disclosure, Inte
     BOOST_CHECK(failed.possibly_exposed);
     BOOST_CHECK(failed.disclosure_saved);
     BOOST_CHECK(ReadStoredPayment(id).exposed);
-    BOOST_CHECK(failed.owns_inputs);
+    BOOST_CHECK(failed.has_unreleased_reservation);
 
     m_service->Cancel(id);
     Flush();
 
     const auto cancelled = *m_service->Snapshot(id);
     BOOST_CHECK(cancelled.phase == PaymentPhase::Cancelled);
-    BOOST_CHECK(cancelled.owns_inputs);
+    BOOST_CHECK(cancelled.has_unreleased_reservation);
     BOOST_CHECK(!cancelled.selected);
     BOOST_CHECK(!cancelled.node_accepted);
 
@@ -1970,7 +2153,7 @@ BOOST_FIXTURE_TEST_CASE(sender_not_sent_poll_preserves_previous_disclosure, Inte
     const auto stopped = *m_service->Snapshot(id);
     BOOST_CHECK(stopped.phase == PaymentPhase::Stopped);
     BOOST_CHECK(stopped.possibly_exposed);
-    BOOST_CHECK(stopped.owns_inputs);
+    BOOST_CHECK(stopped.has_unreleased_reservation);
     BOOST_CHECK(ReadStoredPayment(id).exposed);
 }
 

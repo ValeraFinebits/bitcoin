@@ -15,6 +15,7 @@
 #include <payjoin/client.h>
 #include <payjoin/transport.h>
 #include <policy/feerate.h>
+#include <policy/policy.h>
 #include <primitives/transaction.h>
 #include <psbt.h>
 #include <random.h>
@@ -316,7 +317,7 @@ struct SenderService::State : std::enable_shared_from_this<State> {
         view.original_saved = payment.storage.registered;
         view.selection_saved = payment.storage.selection_saved;
         view.disclosure_saved = payment.storage.disclosure_saved;
-        view.owns_inputs = payment.storage.registered && !payment.storage.released;
+        view.has_unreleased_reservation = payment.storage.registered && !payment.storage.released;
         view.storage_uncertain = payment.storage.uncertain;
         view.locks_verified = payment.locks_verified;
         view.possibly_exposed = payment.exposed;
@@ -1094,7 +1095,14 @@ struct SenderService::State : std::enable_shared_from_this<State> {
             return;
         }
 
-        Publish(payment, MakeTransactionRef(std::move(finalized)));
+        const auto final_tx = MakeTransactionRef(std::move(finalized));
+        const CAmount fee = total - *output_value;
+        if (fee < payment.intent.fee_rate.GetFee(GetVirtualTransactionSize(*final_tx))) {
+            Fail(payment, PaymentIssue::Signing, "final proposal fee rate is below payment policy");
+            return;
+        }
+
+        Publish(payment, final_tx);
     }
 
     void PublishChecked(Payment& payment, CTransactionRef tx) EXCLUSIVE_LOCKS_REQUIRED(m_wallet.cs_wallet) EXCLUSIVE_LOCKS_REQUIRED(!m_views_mutex)

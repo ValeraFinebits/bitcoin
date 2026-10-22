@@ -170,7 +170,10 @@ class PayjoinTest(BitcoinTestFramework):
         payment = sender.getpayjoin(payment_id)
         assert_equal(payment["problem"]["code"], "delivery")
         assert_equal(payment["possibly_exposed"], False)
-        assert_equal(payment["reservations"]["owned"], True)
+        reservations = payment["reservations"]
+        assert isinstance(reservations["unreleased"], bool)
+        assert "owned" not in reservations
+        assert_equal(payment["reservations"]["unreleased"], True)
         duplicate = sender.sendpayjoin(**request)
         assert_equal(duplicate["payment_id"], payment_id)
         assert_equal(duplicate["duplicate"], True)
@@ -182,7 +185,7 @@ class PayjoinTest(BitcoinTestFramework):
         assert_equal(cancelled["result"], "completed")
         assert_equal(cancelled["payment"]["phase"], "cancelled")
         assert_equal(cancelled["payment"]["possibly_exposed"], False)
-        assert_equal(cancelled["payment"]["reservations"]["owned"], False)
+        assert_equal(cancelled["payment"]["reservations"]["unreleased"], False)
         assert_equal(sender.listlockunspent(), locks)
         return payment_id
 
@@ -295,7 +298,7 @@ class PayjoinTest(BitcoinTestFramework):
             self.wait_until(lambda: sender.getpayjoin(payment_id)["phase"] == "confirmed")
             settled = sender.getpayjoin(payment_id)
             assert_equal(settled["selected"]["presence"], "confirmed")
-            assert_equal(settled["reservations"]["owned"], False)
+            assert_equal(settled["reservations"]["unreleased"], False)
             assert_equal(settled["storage_uncertain"], False)
             assert "problem" not in settled, settled
             locks = {(coin["txid"], coin["vout"]) for coin in sender.listlockunspent()}
@@ -309,7 +312,7 @@ class PayjoinTest(BitcoinTestFramework):
             assert_equal(changed["problem"]["code"], "observed_spend")
             assert_equal(changed["selected"]["txid"], txid)
             assert changed["selected"]["presence"] != "confirmed"
-            assert_equal(changed["reservations"]["owned"], False)
+            assert_equal(changed["reservations"]["unreleased"], False)
             node.reconsiderblock(block)
             assert_equal(sender.getpayjoin(payment_id)["phase"], "confirmed")
 
@@ -332,12 +335,12 @@ class PayjoinTest(BitcoinTestFramework):
             self.wait_until(lambda: sender.getpayjoin(deadline_id).get("problem", {}).get("code") == "deadline")
             expired = sender.getpayjoin(deadline_id)
             assert_equal(expired["possibly_exposed"], True)
-            assert_equal(expired["reservations"]["owned"], True)
+            assert_equal(expired["reservations"]["unreleased"], True)
             assert "selected" not in expired
             assert_equal(node.getrawmempool(), [])
             cancelled = sender.cancelpayjoin(deadline_id)
             assert_equal(cancelled["result"], "completed")
-            assert_equal(cancelled["payment"]["reservations"]["owned"], True)
+            assert_equal(cancelled["payment"]["reservations"]["unreleased"], True)
             assert_equal(node.getrawmempool(), [])
             fallback = sender.publishpayjoinfallback(deadline_id)
             assert_equal(fallback["result"], "completed")
