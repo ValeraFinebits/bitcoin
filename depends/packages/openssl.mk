@@ -11,17 +11,19 @@ define $(package)_set_vars
   $(package)_cflags+=-std=gnu11 -fPIC
 endef
 
+# OpenSSL needs no depends headers; omit that include path from compiler metadata.
 define $(package)_config_cmds
   test "$(host)" = "$(build)" && test "$(host_os)" = linux || { echo "OpenSSL depends currently supports native Linux only" >&2; exit 1; }; \
   CC="$($(package)_cc)" AR="$($(package)_ar)" RANLIB="$($(package)_ranlib)" \
-  CFLAGS="$($(package)_cflags)" CPPFLAGS="$($(package)_cppflags)" LDFLAGS="$($(package)_ldflags)" \
+  CFLAGS="$($(package)_cflags)" CPPFLAGS="$(filter-out -I$(host_prefix)/include,$($(package)_cppflags))" LDFLAGS="$($(package)_ldflags)" \
   perl ./Configure $($(package)_config_opts)
 endef
 
+# Modules are disabled, but OpenSSL still embeds their directory in diagnostics.
 define $(package)_build_cmds
-  $(MAKE) build_libs
+  $(MAKE) MODULESDIR=/usr/lib/ossl-modules build_libs
 endef
 
 define $(package)_stage_cmds
-  $(MAKE) DESTDIR=$($(package)_staging_dir) install_dev
+  $(MAKE) MODULESDIR=/usr/lib/ossl-modules DESTDIR=$($(package)_staging_dir) install_dev
 endef

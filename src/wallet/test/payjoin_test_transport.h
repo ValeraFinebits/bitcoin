@@ -14,7 +14,6 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
-#include <optional>
 #include <utility>
 #include <vector>
 
@@ -23,7 +22,8 @@ template <typename... Args>
 class ScopedHook
 {
     std::function<void(Args...)>& m_hook;
-    std::optional<std::function<void(Args...)>> m_previous;
+    std::function<void(Args...)> m_previous;
+    bool m_active{true};
 
 public:
     explicit ScopedHook(std::function<void(Args...)>& hook) : m_hook{hook}, m_previous{std::move(hook)} {}
@@ -36,10 +36,10 @@ public:
 
     void Reset()
     {
-        if (!m_previous) return;
+        if (!std::exchange(m_active, false)) return;
 
-        m_hook = std::move(*m_previous);
-        m_previous.reset();
+        m_hook = std::move(m_previous);
+        m_previous = nullptr;
     }
 };
 
