@@ -55,7 +55,11 @@ static std::string FormatVersion(int nVersion)
 
 std::string FormatFullVersion()
 {
+#ifdef PAYJOIN_RELEASE_VERSION
+    static const std::string CLIENT_BUILD("v" CLIENT_VERSION_STRING "-payjoin-" PAYJOIN_RELEASE_VERSION BUILD_SUFFIX);
+#else
     static const std::string CLIENT_BUILD(BUILD_DESC BUILD_SUFFIX);
+#endif
     return CLIENT_BUILD;
 }
 
