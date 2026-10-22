@@ -419,7 +419,7 @@ void SenderFixture::CheckReleased(const uint256& id)
     const auto view = *m_service->Snapshot(id);
     BOOST_REQUIRE(view.original);
     BOOST_REQUIRE(view.settlement);
-    BOOST_CHECK(!view.owns_inputs);
+    BOOST_CHECK(!view.has_unreleased_reservation);
     BOOST_CHECK(!view.storage_uncertain);
     BOOST_CHECK(!view.issue);
 

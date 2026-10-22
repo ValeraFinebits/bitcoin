@@ -15,6 +15,19 @@ RUSTUP_TOOLCHAIN=1.85.1 rustc --version
 RUSTUP_TOOLCHAIN=1.85.1 cargo --version
 ```
 
+## HTTPS trust
+
+HTTPS CA certificates are provided by the operating system; the archive does not
+bundle them. The depends OpenSSL build uses `/etc/ssl/cert.pem` and the hashed
+`/etc/ssl/certs` directory. Set `SSL_CERT_FILE` and `SSL_CERT_DIR` in the node's
+environment for nonstandard locations. These variables do not guarantee exclusive
+trust in one CA file: other default trust sources can remain active. Restarting
+the node is recommended after changes to trust settings or certificates.
+
+Release-archive HTTPS checks covered Debian 12 with the default paths and Fedora
+44 with `SSL_CERT_DIR=/etc/pki/ca-trust/extracted/pem/directory-hash` and no legacy
+CA bundle files. These transport checks do not establish a completed Payjoin payment.
+
 ## Production FFI build and unit tests
 
 These Core builds use Debug for testing. Keep `source_dir` and `depends_prefix` in one
@@ -80,6 +93,12 @@ It checks the receiver input, publication, confirmation, reorg, idempotency,
 cancellation and explicit fallback. Successful CLI exit is checked before mining;
 `--timeout-factor` scales bounded waits.
 
+`reservations.unreleased` means the service acknowledged registration but has not
+acknowledged release; commands recheck ownership before acting. It is not a fresh
+owner-record or wallet-lock check. With storage uncertainty, `false` can coexist with
+a durable registration whose acknowledgement was lost, and `true` can outlive a
+durable release whose acknowledgement was lost.
+
 ## BTCPay Server regtest smoke test
 
 Prerequisites: both nodes share the same regtest chain; the Core sender wallet is
@@ -94,7 +113,7 @@ Use the [RPC workflow](payjoin-rpc.md#minimal-workflow).
 | 2 | Call `sendpayjoin` with the URI, relay, unique `request_id` and fee cap. | A `payment_id` is returned. |
 | 3 | Repeat the request with identical parameters. | Same `payment_id`, `duplicate=true`. |
 | 4 | Poll `getpayjoin` and inspect the selected transaction. | `published`; `selected.txid` differs from `original.txid`; a receiver-owned input is present; total fee respects the cap; original is absent from the mempool. |
-| 5 | Mine enough blocks for the store's confirmation policy, poll again and check BTCPay. | `confirmed`, settlement kind `selected`, `reservations.owned=false`; invoice is Settled with the invoice amount credited and a "Settled with Payjoin" event. |
+| 5 | Mine enough blocks for the store's confirmation policy, poll again and check BTCPay. | `confirmed`, settlement kind `selected`, `reservations.unreleased=false`; invoice is Settled with the invoice amount credited and a "Settled with Payjoin" event. |
 
 Save the invoice ID, `payment_id`, selected txid, fee and a BTCPay status screenshot.
 

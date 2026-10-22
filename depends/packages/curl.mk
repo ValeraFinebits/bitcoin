@@ -22,7 +22,7 @@ define $(package)_set_vars
   $(package)_config_opts+=-DUSE_NGTCP2=OFF -DUSE_QUICHE=OFF -DCURL_USE_LIBSSH2=OFF -DCURL_USE_LIBSSH=OFF
   $(package)_config_opts+=-DCURL_USE_GSSAPI=OFF -DCURL_USE_GSASL=OFF -DCURL_USE_LIBUV=OFF -DCURL_USE_LIBBACKTRACE=OFF
   $(package)_config_opts+=-DCURL_USE_MBEDTLS=OFF -DCURL_USE_WOLFSSL=OFF -DCURL_USE_GNUTLS=OFF -DCURL_USE_RUSTLS=OFF
-  $(package)_config_opts+=-DCURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt -DCURL_CA_PATH=none -DCURL_CA_FALLBACK=OFF
+  $(package)_config_opts+=-DCURL_CA_BUNDLE=none -DCURL_CA_PATH=none -DCURL_CA_FALLBACK=ON
   $(package)_config_opts+=-DCURL_DISABLE_OPENSSL_AUTO_LOAD_CONFIG=ON
 endef
 

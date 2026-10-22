@@ -188,7 +188,7 @@ UniValue PaymentJSON(const PaymentView& view)
     if (payment.settlement) result.pushKV("settlement", Observation(*payment.settlement));
 
     UniValue reservations{UniValue::VOBJ};
-    reservations.pushKV("owned", payment.owns_inputs);
+    reservations.pushKV("unreleased", payment.has_unreleased_reservation);
     reservations.pushKV("locks_verified", payment.locks_verified);
     result.pushKV("reservations", std::move(reservations));
     result.pushKV("possibly_exposed", payment.possibly_exposed);
@@ -265,7 +265,7 @@ RPCResult PaymentResult(std::string key)
                 "reservations",
                 "Reservation is independent of phase or transaction presence",
                 {
-                    {RPCResult::Type::BOOL, "owned", "Sender still owns the reserved inputs"},
+                    {RPCResult::Type::BOOL, "unreleased", "The service acknowledged reservation registration but not its release; not a fresh owner or lock check. Commands recheck ownership. With storage uncertainty, false may hide a durable registration and true may outlive a durable release with a lost acknowledgement"},
                     {RPCResult::Type::BOOL, "locks_verified", "Current wallet in-memory locks were verified"},
                 },
             },

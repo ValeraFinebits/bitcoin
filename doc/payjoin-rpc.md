@@ -91,9 +91,16 @@ and `available_actions`. `published` and `rejected` record publication results;
 | --- | --- |
 | `original`, `selected` | Signed original and publication choice; fallback selects original; no PSBTs returned |
 | `observed_spend`, `settlement` | Known spend of original inputs; settlement denotes confirmation. A spend matching both transactions has kind `original` |
-| `reservations.owned`, `reservations.locks_verified` | Ownership and current in-memory locks; no proof of database persistence |
+| `reservations.unreleased` | The service acknowledged reservation registration but has not acknowledged its release; not a fresh owner or lock check |
+| `reservations.locks_verified` | Current in-memory locks were verified; no proof of database persistence |
 | `possibly_exposed` | Receiver may hold and broadcast the signed original |
 | `storage_uncertain` | Uncertain storage result blocks unsafe actions |
+
+Commands recheck ownership before acting. `reservations.unreleased` records the service's
+known reservation state, not a fresh check of durable owner records or wallet locks.
+With storage uncertainty, `false` does not prove absence of a durable reservation if
+registration acknowledgement was lost; `true` does not prove a durable reservation
+remains if release succeeded but its acknowledgement was lost.
 
 ## Control commands and problems
 

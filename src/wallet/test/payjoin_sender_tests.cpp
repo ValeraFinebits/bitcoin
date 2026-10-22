@@ -342,7 +342,7 @@ void CheckRetainedReservations(SenderFixture& fixture, const PaymentSnapshot& vi
 {
     BOOST_REQUIRE(view.original);
     BOOST_CHECK(view.original_saved);
-    BOOST_CHECK(view.owns_inputs);
+    BOOST_CHECK(view.has_unreleased_reservation);
 
     BOOST_CHECK(!fixture.ReadStoredPayment(view.id).released);
 
@@ -452,7 +452,7 @@ void CheckPreparationWithPendingBlock(SenderFixture& fixture, bool send)
     BOOST_CHECK(failed.phase == PaymentPhase::Attention);
     BOOST_CHECK(failed.issue == PaymentIssue::Preparation);
     BOOST_CHECK(!failed.original);
-    BOOST_CHECK(!failed.owns_inputs);
+    BOOST_CHECK(!failed.has_unreleased_reservation);
     BOOST_CHECK(!failed.possibly_exposed);
     BOOST_CHECK(!fixture.HasStoredPayment(id));
     BOOST_CHECK_EQUAL(fixture.m_transport->m_attempts, 0);
@@ -532,7 +532,7 @@ BOOST_AUTO_TEST_CASE(sender_cancel_before_preparation_barrier_prevents_wallet_wo
     const auto cancelled = *m_service->Snapshot(id);
     BOOST_CHECK(cancelled.phase == PaymentPhase::Cancelled);
     BOOST_CHECK(!cancelled.original);
-    BOOST_CHECK(!cancelled.owns_inputs);
+    BOOST_CHECK(!cancelled.has_unreleased_reservation);
     BOOST_CHECK(!cancelled.possibly_exposed);
     BOOST_CHECK(!HasStoredPayment(id));
     BOOST_CHECK_EQUAL(m_database->WriteCount(), writes);
@@ -555,7 +555,7 @@ BOOST_AUTO_TEST_CASE(sender_preparation_barrier_wait_counts_towards_deadline)
     BOOST_CHECK(expired.phase == PaymentPhase::Attention);
     BOOST_CHECK(expired.issue == PaymentIssue::Deadline);
     BOOST_CHECK(!expired.original);
-    BOOST_CHECK(!expired.owns_inputs);
+    BOOST_CHECK(!expired.has_unreleased_reservation);
     BOOST_CHECK(!expired.possibly_exposed);
     BOOST_CHECK(!HasStoredPayment(id));
     BOOST_CHECK_EQUAL(m_database->WriteCount(), writes);
@@ -588,7 +588,7 @@ BOOST_AUTO_TEST_CASE(sender_command_results_belong_to_each_invocation)
     const auto& payment = second.payments.front().payment;
     BOOST_CHECK(payment.phase == PaymentPhase::Cancelled);
     BOOST_CHECK(!second.refusal);
-    BOOST_CHECK(!payment.owns_inputs);
+    BOOST_CHECK(!payment.has_unreleased_reservation);
     BOOST_REQUIRE(payment.original);
     BOOST_CHECK(ReadStoredPayment(id).released);
     for (const auto& input : payment.original->vin) {
@@ -700,7 +700,7 @@ BOOST_AUTO_TEST_CASE(sender_command_reports_partial_storage_failure)
     BOOST_CHECK(result.status == CommandStatus::Failed);
     BOOST_REQUIRE_EQUAL(result.payments.size(), 1);
     BOOST_CHECK(result.payments.front().payment.storage_uncertain);
-    BOOST_CHECK(result.payments.front().payment.owns_inputs);
+    BOOST_CHECK(result.payments.front().payment.has_unreleased_reservation);
     BOOST_CHECK(result.payments.front().payment.issue == PaymentIssue::Storage);
 }
 
@@ -746,7 +746,7 @@ BOOST_AUTO_TEST_CASE(sender_api_registration_does_not_wait_for_wallet_execution)
         BOOST_CHECK(result.status == CommandStatus::Stopped);
         BOOST_REQUIRE_EQUAL(result.payments.size(), 1);
         BOOST_CHECK(!result.payments.front().payment.possibly_exposed);
-        BOOST_CHECK(!result.payments.front().payment.owns_inputs);
+        BOOST_CHECK(!result.payments.front().payment.has_unreleased_reservation);
     }
     const auto final = scheduled->Snapshot(id);
     BOOST_REQUIRE(final && final->original);
@@ -876,7 +876,7 @@ BOOST_AUTO_TEST_CASE(sender_operations_during_transport_stop_receive_final_deliv
         BOOST_REQUIRE_EQUAL(result.payments.size(), 1);
         BOOST_CHECK(result.payments.front().payment.id == id);
         BOOST_CHECK(!result.payments.front().payment.possibly_exposed);
-        BOOST_CHECK(!result.payments.front().payment.owns_inputs);
+        BOOST_CHECK(!result.payments.front().payment.has_unreleased_reservation);
     }
     const auto final = m_service->Snapshot(id);
     BOOST_REQUIRE(final && final->original);
@@ -1133,7 +1133,7 @@ BOOST_AUTO_TEST_CASE(sender_retains_exposed_original_until_explicit_fallback)
     const auto cancelled = *m_service->Snapshot(id);
     BOOST_CHECK(cancelled.phase == PaymentPhase::Cancelled);
     BOOST_CHECK(cancelled.possibly_exposed);
-    BOOST_CHECK(cancelled.owns_inputs);
+    BOOST_CHECK(cancelled.has_unreleased_reservation);
     BOOST_CHECK(!cancelled.selected);
     BOOST_REQUIRE(cancelled.original->HasWitness());
 
@@ -1194,7 +1194,7 @@ BOOST_AUTO_TEST_CASE(sender_stop_uses_not_sent_without_draining_executor)
     const auto stopped = *m_service->Snapshot(id);
     BOOST_CHECK(stopped.phase == PaymentPhase::Stopped);
     BOOST_CHECK(!stopped.possibly_exposed);
-    BOOST_CHECK(!stopped.owns_inputs);
+    BOOST_CHECK(!stopped.has_unreleased_reservation);
     BOOST_CHECK(!stopped.storage_uncertain);
     BOOST_CHECK(!ReadStoredPayment(id).exposed);
     BOOST_CHECK(ReadStoredPayment(id).released);
@@ -1231,7 +1231,7 @@ BOOST_AUTO_TEST_CASE(sender_stop_uses_not_sent_queued_before_stop)
     const auto stopped = *m_service->Snapshot(id);
     BOOST_CHECK(stopped.phase == PaymentPhase::Stopped);
     BOOST_CHECK(!stopped.possibly_exposed);
-    BOOST_CHECK(!stopped.owns_inputs);
+    BOOST_CHECK(!stopped.has_unreleased_reservation);
     BOOST_CHECK(ReadStoredPayment(id).released);
 }
 
@@ -1251,7 +1251,7 @@ BOOST_AUTO_TEST_CASE(sender_stop_uses_not_sent_after_deadline)
     const auto stopped = *m_service->Snapshot(id);
     BOOST_CHECK(stopped.phase == PaymentPhase::Stopped);
     BOOST_CHECK(!stopped.possibly_exposed);
-    BOOST_CHECK(!stopped.owns_inputs);
+    BOOST_CHECK(!stopped.has_unreleased_reservation);
     BOOST_CHECK(ReadStoredPayment(id).released);
 }
 
@@ -1267,14 +1267,14 @@ BOOST_AUTO_TEST_CASE(sender_stop_uses_not_sent_after_cancel)
 
     BOOST_REQUIRE(m_service->Snapshot(id)->phase == PaymentPhase::Cancelled);
     BOOST_REQUIRE(m_service->Snapshot(id)->possibly_exposed);
-    BOOST_REQUIRE(m_service->Snapshot(id)->owns_inputs);
+    BOOST_REQUIRE(m_service->Snapshot(id)->has_unreleased_reservation);
 
     m_service->Stop();
 
     const auto stopped = *m_service->Snapshot(id);
     BOOST_CHECK(stopped.phase == PaymentPhase::Stopped);
     BOOST_CHECK(!stopped.possibly_exposed);
-    BOOST_CHECK(!stopped.owns_inputs);
+    BOOST_CHECK(!stopped.has_unreleased_reservation);
     BOOST_CHECK(ReadStoredPayment(id).released);
 }
 
@@ -1294,7 +1294,7 @@ BOOST_AUTO_TEST_CASE(sender_stop_not_sent_save_failure_keeps_reservation)
     BOOST_CHECK(stopped.issue == PaymentIssue::Storage);
     BOOST_CHECK(stopped.storage_uncertain);
     BOOST_CHECK(stopped.possibly_exposed);
-    BOOST_CHECK(stopped.owns_inputs);
+    BOOST_CHECK(stopped.has_unreleased_reservation);
     BOOST_CHECK(ReadStoredPayment(id).exposed);
     BOOST_CHECK(!ReadStoredPayment(id).released);
 }
@@ -1311,7 +1311,7 @@ BOOST_FIXTURE_TEST_CASE(sender_stop_uncertain_keeps_reservation, UncertainStopFi
     const auto stopped = *m_service->Snapshot(id);
     BOOST_CHECK(stopped.phase == PaymentPhase::Stopped);
     BOOST_CHECK(stopped.possibly_exposed);
-    BOOST_CHECK(stopped.owns_inputs);
+    BOOST_CHECK(stopped.has_unreleased_reservation);
     BOOST_CHECK(ReadStoredPayment(id).exposed);
     BOOST_CHECK(!ReadStoredPayment(id).released);
 }
@@ -1363,7 +1363,7 @@ BOOST_AUTO_TEST_CASE(sender_cancel_before_dispatch_releases_only_its_inputs)
     BOOST_REQUIRE_MESSAGE(active.transport_accepted, active.diagnostic);
     BOOST_CHECK(cancelled.phase == PaymentPhase::Cancelled);
     BOOST_CHECK(!cancelled.possibly_exposed);
-    BOOST_CHECK(!cancelled.owns_inputs);
+    BOOST_CHECK(!cancelled.has_unreleased_reservation);
     BOOST_REQUIRE_EQUAL(m_transport->m_pending.size(), 1);
 
     LOCK(m_sender->cs_wallet);
@@ -1382,7 +1382,7 @@ BOOST_AUTO_TEST_CASE(sender_cancelled_payment_stays_cancelled_after_coin_reuse)
     const auto cancelled = *m_service->Snapshot(id);
     BOOST_REQUIRE(cancelled.phase == PaymentPhase::Cancelled);
     BOOST_REQUIRE(cancelled.original);
-    BOOST_REQUIRE(!cancelled.owns_inputs);
+    BOOST_REQUIRE(!cancelled.has_unreleased_reservation);
     BOOST_REQUIRE(!cancelled.possibly_exposed);
 
     auto next_intent = Intent();
@@ -1391,7 +1391,7 @@ BOOST_AUTO_TEST_CASE(sender_cancelled_payment_stays_cancelled_after_coin_reuse)
     const auto next = m_service->Start(next_intent);
     Flush();
 
-    BOOST_REQUIRE(m_service->Snapshot(next)->owns_inputs);
+    BOOST_REQUIRE(m_service->Snapshot(next)->has_unreleased_reservation);
     Confirm(m_service->Snapshot(next)->original);
     const auto input = cancelled.original->vin[0].prevout;
     const bool locked = WITH_LOCK(m_sender->cs_wallet, return m_sender->IsLockedCoin(input));
@@ -1404,7 +1404,7 @@ BOOST_AUTO_TEST_CASE(sender_cancelled_payment_stays_cancelled_after_coin_reuse)
     const auto after = *m_service->Snapshot(id);
     BOOST_CHECK(after.phase == PaymentPhase::Cancelled);
     BOOST_CHECK(!after.settlement);
-    BOOST_CHECK(!after.owns_inputs);
+    BOOST_CHECK(!after.has_unreleased_reservation);
 
     LOCK(m_sender->cs_wallet);
     auto owner = ReadOwner(input);
@@ -1448,7 +1448,7 @@ BOOST_AUTO_TEST_CASE(sender_pending_request_deadline_preserves_original)
     const auto view = *m_service->Snapshot(id);
     BOOST_CHECK(view.issue == PaymentIssue::Deadline);
     BOOST_CHECK(view.possibly_exposed);
-    BOOST_CHECK(view.owns_inputs);
+    BOOST_CHECK(view.has_unreleased_reservation);
     BOOST_CHECK(!view.selected);
     BOOST_CHECK_EQUAL(m_transport->m_cancelled.size(), 1);
 }
@@ -1488,7 +1488,7 @@ BOOST_AUTO_TEST_CASE(sender_handoff_and_busy_retry_deadline_boundaries)
                 BOOST_CHECK(!view.selected);
                 BOOST_CHECK(!view.wallet_recorded);
                 BOOST_CHECK(!view.node_accepted);
-                BOOST_CHECK(view.owns_inputs);
+                BOOST_CHECK(view.has_unreleased_reservation);
 
                 BOOST_CHECK(!m_node.mempool->exists(view.original->GetHash()));
 
@@ -1523,7 +1523,7 @@ BOOST_AUTO_TEST_CASE(sender_handoff_and_busy_retry_deadline_boundaries)
                 m_service->Cancel(id);
                 Flush();
 
-                BOOST_CHECK(!m_service->Snapshot(id)->owns_inputs);
+                BOOST_CHECK(!m_service->Snapshot(id)->has_unreleased_reservation);
             }
         }
     }
@@ -1563,7 +1563,7 @@ BOOST_AUTO_TEST_CASE(sender_registration_begin_failure_preserves_database_and_fo
     BOOST_CHECK(view.issue == PaymentIssue::Storage);
     BOOST_CHECK_EQUAL(view.diagnostic, "registration transaction failed");
     BOOST_CHECK(!view.original_saved);
-    BOOST_CHECK(!view.owns_inputs);
+    BOOST_CHECK(!view.has_unreleased_reservation);
     BOOST_CHECK(!view.storage_uncertain);
     BOOST_CHECK(!view.possibly_exposed);
     BOOST_CHECK(!view.transport_accepted);
@@ -1629,7 +1629,7 @@ BOOST_AUTO_TEST_CASE(sender_registration_commit_failure_rolls_back_written_recor
     BOOST_CHECK(view.issue == PaymentIssue::Storage);
     BOOST_CHECK_EQUAL(view.diagnostic, "registration failed");
     BOOST_CHECK(!view.original_saved);
-    BOOST_CHECK(!view.owns_inputs);
+    BOOST_CHECK(!view.has_unreleased_reservation);
     BOOST_CHECK(!view.storage_uncertain);
     BOOST_CHECK(!view.possibly_exposed);
     BOOST_CHECK(!view.transport_accepted);
@@ -1670,6 +1670,7 @@ BOOST_AUTO_TEST_CASE(sender_registration_lost_commit_acknowledgement_preserves_d
     BOOST_CHECK_EQUAL(view.diagnostic, "registration failed");
     BOOST_CHECK(view.storage_uncertain);
     BOOST_CHECK(!view.original_saved);
+    BOOST_CHECK(!view.has_unreleased_reservation);
     BOOST_CHECK(!view.possibly_exposed);
     BOOST_CHECK(!view.transport_accepted);
     BOOST_CHECK_EQUAL(m_transport->m_attempts, 0);
@@ -1717,7 +1718,7 @@ BOOST_AUTO_TEST_CASE(sender_partial_lock_failure_forbids_dispatch)
     const auto view = *m_service->Snapshot(id);
     BOOST_CHECK(view.issue == PaymentIssue::Storage);
     BOOST_CHECK(view.original_saved);
-    BOOST_CHECK(view.owns_inputs);
+    BOOST_CHECK(view.has_unreleased_reservation);
     BOOST_CHECK(view.storage_uncertain);
     BOOST_CHECK(m_transport->m_pending.empty());
 }
@@ -1736,7 +1737,7 @@ void CheckUnregisteredForeignSpend(SenderFixture& fixture, bool collision, bool 
     const auto before = *fixture.m_service->Snapshot(id);
     BOOST_REQUIRE(before.original);
     BOOST_REQUIRE(!before.original_saved);
-    BOOST_REQUIRE(!before.owns_inputs);
+    BOOST_REQUIRE(!before.has_unreleased_reservation);
     BOOST_REQUIRE_EQUAL(before.storage_uncertain, uncertain);
     BOOST_REQUIRE(before.issue);
     BOOST_REQUIRE(!before.diagnostic.empty());
@@ -1792,7 +1793,7 @@ void CheckUnregisteredForeignSpend(SenderFixture& fixture, bool collision, bool 
         BOOST_CHECK_EQUAL(view.diagnostic, before.diagnostic);
         BOOST_CHECK_EQUAL(view.storage_uncertain, uncertain);
         BOOST_CHECK(!view.original_saved);
-        BOOST_CHECK(!view.owns_inputs);
+        BOOST_CHECK(!view.has_unreleased_reservation);
         BOOST_CHECK(!fixture.HasStoredPayment(id));
         for (const auto& input : before.original->vin) {
             auto owner = fixture.ReadOwner(input.prevout);
@@ -1884,7 +1885,7 @@ BOOST_AUTO_TEST_CASE(sender_observation_uses_spending_index_before_original_is_r
     BOOST_CHECK(view.observed_spend->transaction->GetHash() == std::min(confirmed[0]->GetHash(), confirmed[1]->GetHash()));
     BOOST_REQUIRE(view.settlement);
     BOOST_CHECK(view.settlement->transaction == view.observed_spend->transaction);
-    BOOST_CHECK(!view.owns_inputs);
+    BOOST_CHECK(!view.has_unreleased_reservation);
     BOOST_CHECK(ReadStoredPayment(id).released);
 }
 
@@ -1916,7 +1917,7 @@ BOOST_AUTO_TEST_CASE(sender_initial_dispatch_trusts_persistent_memory_lock)
 
     const auto view = *m_service->Snapshot(id);
     BOOST_CHECK(!view.issue);
-    BOOST_CHECK(view.owns_inputs);
+    BOOST_CHECK(view.has_unreleased_reservation);
     BOOST_CHECK(view.locks_verified);
     BOOST_CHECK(view.possibly_exposed);
     BOOST_CHECK(view.transport_accepted);
@@ -1949,7 +1950,7 @@ BOOST_AUTO_TEST_CASE(sender_initial_dispatch_rechecks_manual_unlock)
 
     const auto view = *m_service->Snapshot(id);
     BOOST_CHECK(view.issue == PaymentIssue::Reservation);
-    BOOST_CHECK(view.owns_inputs);
+    BOOST_CHECK(view.has_unreleased_reservation);
     BOOST_CHECK(!view.locks_verified);
     BOOST_CHECK(!view.possibly_exposed);
     BOOST_CHECK(!view.selected);
@@ -1984,7 +1985,7 @@ BOOST_AUTO_TEST_CASE(sender_persistent_marker_without_memory_flag_forbids_dispat
 
     const auto view = *m_service->Snapshot(id);
     BOOST_CHECK(view.issue == PaymentIssue::Reservation);
-    BOOST_CHECK(view.owns_inputs);
+    BOOST_CHECK(view.has_unreleased_reservation);
     BOOST_CHECK(!view.locks_verified);
     BOOST_CHECK(!view.possibly_exposed);
     BOOST_CHECK(!view.selected);
@@ -2198,7 +2199,7 @@ BOOST_AUTO_TEST_CASE(sender_created_journal_failure_forbids_dispatch)
     BOOST_CHECK(view.issue == PaymentIssue::Storage);
     BOOST_CHECK(view.storage_uncertain);
     BOOST_CHECK(view.original_saved);
-    BOOST_CHECK(view.owns_inputs);
+    BOOST_CHECK(view.has_unreleased_reservation);
     BOOST_CHECK(!view.possibly_exposed);
     BOOST_CHECK(m_transport->m_pending.empty());
     m_database->CheckWriteFailed();
@@ -2215,7 +2216,7 @@ BOOST_AUTO_TEST_CASE(sender_disclosure_write_failure_forbids_dispatch)
     BOOST_CHECK(view.issue == PaymentIssue::Storage);
     BOOST_CHECK(view.storage_uncertain);
     BOOST_CHECK(view.possibly_exposed);
-    BOOST_CHECK(view.owns_inputs);
+    BOOST_CHECK(view.has_unreleased_reservation);
     BOOST_CHECK(m_transport->m_pending.empty());
 }
 
@@ -2231,7 +2232,7 @@ BOOST_AUTO_TEST_CASE(sender_invalid_intent_has_no_reservation)
         const auto view = *m_service->Snapshot(id);
         BOOST_CHECK(view.issue == PaymentIssue::InvalidIntent);
         BOOST_CHECK(!view.original);
-        BOOST_CHECK(!view.owns_inputs);
+        BOOST_CHECK(!view.has_unreleased_reservation);
         BOOST_CHECK(!view.original_saved);
     }
 
@@ -2299,7 +2300,7 @@ BOOST_AUTO_TEST_CASE(sender_intent_policy_boundaries)
                     BOOST_CHECK(!view.transport_accepted);
                     BOOST_CHECK(!view.original);
                     BOOST_CHECK(!view.original_saved);
-                    BOOST_CHECK(!view.owns_inputs);
+                    BOOST_CHECK(!view.has_unreleased_reservation);
 
                     BOOST_CHECK(!HasStoredPayment(id));
                     BOOST_CHECK(!m_database->MakeBatch()->Exists(std::pair{std::string{JOURNAL_RECORD}, id}));
@@ -2311,7 +2312,7 @@ BOOST_AUTO_TEST_CASE(sender_intent_policy_boundaries)
                     BOOST_REQUIRE(view.original);
                     BOOST_CHECK_EQUAL(m_transport->m_attempts, attempts + 1);
                     BOOST_CHECK(view.original_saved);
-                    BOOST_CHECK(view.owns_inputs);
+                    BOOST_CHECK(view.has_unreleased_reservation);
 
                     BOOST_CHECK(HasStoredPayment(id));
                     BOOST_CHECK(WriteCount(writes, PAYMENT_RECORD) > 0);
@@ -2395,7 +2396,7 @@ BOOST_AUTO_TEST_CASE(sender_original_fee_budget_boundary)
                 BOOST_CHECK_EQUAL(view.diagnostic, "original fee exceeds policy");
                 BOOST_CHECK_EQUAL(m_transport->m_attempts, attempts);
                 BOOST_CHECK(!view.original);
-                BOOST_CHECK(!view.owns_inputs);
+                BOOST_CHECK(!view.has_unreleased_reservation);
                 BOOST_CHECK(!HasStoredPayment(id));
                 BOOST_CHECK(!m_database->MakeBatch()->Exists(std::pair{std::string{JOURNAL_RECORD}, id}));
                 for (const auto& type : std::vector<std::string>{PAYMENT_RECORD, JOURNAL_RECORD, OWNER_RECORD, DBKeys::LOCKED_UTXO}) {
@@ -2421,7 +2422,7 @@ BOOST_AUTO_TEST_CASE(sender_original_fee_budget_boundary)
                 }
                 BOOST_CHECK_EQUAL(total - view.original->GetValueOut(), fee);
                 BOOST_CHECK_EQUAL(m_transport->m_attempts, attempts + 1);
-                BOOST_CHECK(view.owns_inputs);
+                BOOST_CHECK(view.has_unreleased_reservation);
                 BOOST_CHECK(HasStoredPayment(id));
             }
         }
@@ -2459,7 +2460,7 @@ BOOST_AUTO_TEST_CASE(sender_confirmed_conflict_releases_exposed_inputs)
 
     const auto view = *m_service->Snapshot(id);
     BOOST_CHECK(view.phase == PaymentPhase::Conflicted);
-    BOOST_CHECK(!view.owns_inputs);
+    BOOST_CHECK(!view.has_unreleased_reservation);
     BOOST_CHECK(!view.selected);
 
     m_service->PublishFallback(id);
@@ -2475,7 +2476,7 @@ BOOST_AUTO_TEST_CASE(sender_confirmed_conflict_releases_exposed_inputs)
 
         BOOST_CHECK(!m_service->Snapshot(id)->settlement);
         BOOST_CHECK(m_service->Snapshot(id)->phase == PaymentPhase::Attention);
-        BOOST_CHECK(!m_service->Snapshot(id)->owns_inputs);
+        BOOST_CHECK(!m_service->Snapshot(id)->has_unreleased_reservation);
         BOOST_CHECK(!m_service->Snapshot(id)->fallback_available);
     }
 
@@ -2515,7 +2516,7 @@ BOOST_AUTO_TEST_CASE(sender_confirmed_original_survives_cancel_and_stop)
     BOOST_CHECK(view.phase == PaymentPhase::Confirmed);
     BOOST_REQUIRE(view.settlement);
     BOOST_CHECK(view.settlement->kind == SpendKind::Original);
-    BOOST_CHECK(!view.owns_inputs);
+    BOOST_CHECK(!view.has_unreleased_reservation);
     BOOST_CHECK(!view.selected);
 
     BOOST_CHECK(Journal(id) == journal);
@@ -2542,7 +2543,7 @@ BOOST_AUTO_TEST_CASE(sender_stop_clears_actions_for_selected_unconfirmed_payment
     BOOST_REQUIRE(before.selected);
     BOOST_REQUIRE(before.selection_saved);
     BOOST_REQUIRE(before.wallet_recorded);
-    BOOST_REQUIRE(before.owns_inputs);
+    BOOST_REQUIRE(before.has_unreleased_reservation);
     BOOST_REQUIRE(!before.node_accepted);
     BOOST_REQUIRE(!before.settlement);
     BOOST_REQUIRE(before.publication_retry_available);
@@ -2571,7 +2572,7 @@ BOOST_AUTO_TEST_CASE(sender_stop_clears_actions_for_selected_unconfirmed_payment
             BOOST_CHECK(view.selected->Equals(*before.selected));
             BOOST_CHECK(view.selection_saved);
             BOOST_CHECK(view.wallet_recorded);
-            BOOST_CHECK(view.owns_inputs);
+            BOOST_CHECK(view.has_unreleased_reservation);
             BOOST_CHECK(!view.node_accepted);
             BOOST_CHECK(!view.settlement);
             BOOST_CHECK(view.possibly_exposed == before.possibly_exposed);
@@ -2647,7 +2648,7 @@ BOOST_AUTO_TEST_CASE(sender_broadcast_disabled_and_current_observation)
     Flush();
 
     BOOST_CHECK(m_service->Snapshot(id)->selected_presence == TransactionPresence::Abandoned);
-    BOOST_CHECK(m_service->Snapshot(id)->owns_inputs);
+    BOOST_CHECK(m_service->Snapshot(id)->has_unreleased_reservation);
 
     m_service->RetryPublication(id);
     Flush();
@@ -2698,7 +2699,7 @@ BOOST_AUTO_TEST_CASE(sender_observes_receiver_original_in_mempool)
     BOOST_CHECK(view.original_presence == TransactionPresence::Mempool);
     BOOST_REQUIRE(view.observed_spend);
     BOOST_CHECK(view.observed_spend->kind == SpendKind::Original);
-    BOOST_CHECK(view.owns_inputs);
+    BOOST_CHECK(view.has_unreleased_reservation);
     BOOST_CHECK(!view.settlement);
     BOOST_REQUIRE(!m_transport->m_pending.empty());
 
@@ -2713,7 +2714,7 @@ BOOST_AUTO_TEST_CASE(sender_observes_receiver_original_in_mempool)
     BOOST_CHECK(view.node_accepted);
     BOOST_CHECK(view.selection_saved);
     BOOST_CHECK(view.wallet_recorded);
-    BOOST_CHECK(view.owns_inputs);
+    BOOST_CHECK(view.has_unreleased_reservation);
     BOOST_CHECK(!view.issue);
     BOOST_CHECK(!view.fallback_available);
     BOOST_REQUIRE_EQUAL(m_transport->m_cancelled.size(), 1);
@@ -2734,7 +2735,7 @@ BOOST_AUTO_TEST_CASE(sender_observes_receiver_original_in_mempool)
     BOOST_REQUIRE(view.selected);
     BOOST_CHECK(view.selected->GetWitnessHash() == original->GetWitnessHash());
     BOOST_CHECK(view.node_accepted);
-    BOOST_CHECK(view.owns_inputs);
+    BOOST_CHECK(view.has_unreleased_reservation);
     BOOST_CHECK(view.phase == PaymentPhase::Published);
     BOOST_CHECK(!view.issue);
 
@@ -2774,7 +2775,7 @@ BOOST_AUTO_TEST_CASE(sender_mempool_fallback_reports_publication_failures)
             BOOST_CHECK(view.selected->GetWitnessHash() == original->GetWitnessHash());
             BOOST_CHECK(view.phase != PaymentPhase::Published);
             BOOST_CHECK(!view.node_accepted);
-            BOOST_CHECK(view.owns_inputs);
+            BOOST_CHECK(view.has_unreleased_reservation);
             BOOST_CHECK(view.storage_uncertain == fail_save);
             BOOST_CHECK(view.selection_saved == !fail_save);
             BOOST_CHECK(view.issue == (fail_save ? PaymentIssue::Storage : PaymentIssue::BroadcastDisabled));
@@ -2916,7 +2917,7 @@ BOOST_AUTO_TEST_CASE(sender_release_failure_preserves_ownership)
 
     const auto view = *m_service->Snapshot(id);
     BOOST_CHECK(view.storage_uncertain);
-    BOOST_CHECK(view.owns_inputs);
+    BOOST_CHECK(view.has_unreleased_reservation);
     BOOST_CHECK(!view.locks_verified);
     BOOST_CHECK(view.phase == PaymentPhase::Attention);
     BOOST_CHECK(!view.possibly_exposed);
@@ -2990,7 +2991,7 @@ BOOST_AUTO_TEST_CASE(sender_owner_collision_is_known_registration_failure)
     BOOST_CHECK(view.issue == PaymentIssue::Reservation);
     BOOST_CHECK(!view.storage_uncertain);
     BOOST_CHECK(!view.original_saved);
-    BOOST_CHECK(!view.owns_inputs);
+    BOOST_CHECK(!view.has_unreleased_reservation);
     BOOST_CHECK(m_transport->m_pending.empty());
     BOOST_CHECK(!HasStoredPayment(id));
 
@@ -3123,7 +3124,7 @@ BOOST_AUTO_TEST_CASE(sender_refresh_separates_submission_from_mempool_presence)
     const auto view = *m_service->Snapshot(id);
     BOOST_CHECK(view.node_accepted);
     BOOST_CHECK(view.selected_presence == TransactionPresence::Inactive);
-    BOOST_CHECK(view.owns_inputs);
+    BOOST_CHECK(view.has_unreleased_reservation);
     BOOST_CHECK(!view.settlement);
 }
 
@@ -3151,7 +3152,7 @@ BOOST_AUTO_TEST_CASE(sender_confirmed_release_failure_survives_refresh)
     BOOST_CHECK(failed.phase == PaymentPhase::Confirmed);
     BOOST_CHECK(failed.issue == PaymentIssue::Storage);
     BOOST_CHECK(failed.storage_uncertain);
-    BOOST_CHECK(failed.owns_inputs);
+    BOOST_CHECK(failed.has_unreleased_reservation);
     BOOST_CHECK(!failed.locks_verified);
     BOOST_CHECK(!failed.diagnostic.empty());
     const auto failed_result = failed_refresh.get();
@@ -3172,7 +3173,7 @@ BOOST_AUTO_TEST_CASE(sender_confirmed_release_failure_survives_refresh)
     BOOST_CHECK(repeated.issue == failed.issue);
     BOOST_CHECK_EQUAL(repeated.diagnostic, failed.diagnostic);
     BOOST_CHECK(repeated.storage_uncertain);
-    BOOST_CHECK(repeated.owns_inputs);
+    BOOST_CHECK(repeated.has_unreleased_reservation);
     BOOST_CHECK(!repeated.locks_verified);
     BOOST_CHECK_EQUAL(m_database->WriteCount(), writes);
     const auto refresh_result = refresh_future.get();
@@ -3222,7 +3223,7 @@ BOOST_AUTO_TEST_CASE(sender_observation_exception_reports_failure_per_invocation
         const auto& payment = result.payments.front().payment;
         BOOST_CHECK(payment.issue == PaymentIssue::Storage);
         BOOST_CHECK(payment.storage_uncertain);
-        BOOST_CHECK(payment.owns_inputs);
+        BOOST_CHECK(payment.has_unreleased_reservation);
         BOOST_CHECK(!result.diagnostic.empty());
         BOOST_CHECK_EQUAL(result.diagnostic, payment.diagnostic);
         BOOST_CHECK(ReadRecords(*m_database, {PAYMENT_RECORD, OWNER_RECORD, DBKeys::LOCKED_UTXO}) == records);
@@ -3262,7 +3263,7 @@ BOOST_AUTO_TEST_CASE(sender_read_failure_still_updates_other_payments)
     const auto& failed = result.payments.front().payment;
     BOOST_CHECK(failed.id == failed_id);
     BOOST_CHECK(failed.storage_uncertain);
-    BOOST_CHECK(failed.owns_inputs);
+    BOOST_CHECK(failed.has_unreleased_reservation);
     BOOST_CHECK(failed.issue == PaymentIssue::Storage);
     BOOST_CHECK(!result.diagnostic.empty());
     BOOST_CHECK_EQUAL(result.diagnostic, failed.diagnostic);
@@ -3313,7 +3314,7 @@ BOOST_AUTO_TEST_CASE(sender_notification_release_failure_preserves_uncertainty)
     BOOST_CHECK(failed.phase == PaymentPhase::Confirmed);
     BOOST_CHECK(failed.issue == PaymentIssue::Storage);
     BOOST_CHECK(failed.storage_uncertain);
-    BOOST_CHECK(failed.owns_inputs);
+    BOOST_CHECK(failed.has_unreleased_reservation);
     BOOST_CHECK(!failed.locks_verified);
     BOOST_CHECK(!failed.diagnostic.empty());
     BOOST_CHECK(!ReadStoredPayment(id).released);
@@ -3360,7 +3361,7 @@ BOOST_AUTO_TEST_CASE(sender_queued_notification_does_not_settle_during_stop)
     Confirm(original);
     m_node.chain->waitForNotifications();
     BOOST_REQUIRE(!m_service->Snapshot(id)->settlement);
-    BOOST_REQUIRE(m_service->Snapshot(id)->owns_inputs);
+    BOOST_REQUIRE(m_service->Snapshot(id)->has_unreleased_reservation);
 
     cleanup.m_stopper = std::thread{[&] {
         m_service->Stop();
@@ -3371,7 +3372,7 @@ BOOST_AUTO_TEST_CASE(sender_queued_notification_does_not_settle_during_stop)
     const auto writes = m_database->WriteCount();
     m_queue->flush();
     BOOST_CHECK(!m_service->Snapshot(id)->settlement);
-    BOOST_CHECK(m_service->Snapshot(id)->owns_inputs);
+    BOOST_CHECK(m_service->Snapshot(id)->has_unreleased_reservation);
     BOOST_CHECK(m_service->Snapshot(id)->issue == PaymentIssue::Delivery);
     BOOST_CHECK_EQUAL(m_database->WriteCount(), writes);
     BOOST_CHECK(ReadRecords(*m_database, {PAYMENT_RECORD, JOURNAL_RECORD, OWNER_RECORD, DBKeys::LOCKED_UTXO}) == records);
@@ -3450,7 +3451,7 @@ BOOST_AUTO_TEST_CASE(sender_busy_wait_is_cancelled_or_expires)
 
     BOOST_CHECK_EQUAL(m_transport->m_attempts, attempts);
     BOOST_CHECK(m_service->Snapshot(cancelled)->phase == PaymentPhase::Cancelled);
-    BOOST_CHECK(!m_service->Snapshot(cancelled)->owns_inputs);
+    BOOST_CHECK(!m_service->Snapshot(cancelled)->has_unreleased_reservation);
     BOOST_CHECK(m_service->Snapshot(expired)->issue == PaymentIssue::Deadline);
     BOOST_CHECK(m_transport->m_pending.empty());
 }
@@ -3479,7 +3480,7 @@ BOOST_AUTO_TEST_CASE(sender_dispatch_deadline_after_disclosure)
     m_service->Cancel(id);
     Flush();
 
-    BOOST_CHECK(!m_service->Snapshot(id)->owns_inputs);
+    BOOST_CHECK(!m_service->Snapshot(id)->has_unreleased_reservation);
 }
 
 BOOST_AUTO_TEST_CASE(sender_rejected_initial_submit_releases_on_cancel)
@@ -3494,7 +3495,7 @@ BOOST_AUTO_TEST_CASE(sender_rejected_initial_submit_releases_on_cancel)
             const auto failed = *m_service->Snapshot(id);
             BOOST_CHECK(failed.issue == PaymentIssue::Delivery);
             BOOST_CHECK(failed.original_saved);
-            BOOST_CHECK(failed.owns_inputs);
+            BOOST_CHECK(failed.has_unreleased_reservation);
             BOOST_CHECK(!failed.possibly_exposed);
             BOOST_CHECK(!failed.disclosure_saved);
             BOOST_CHECK(!failed.transport_accepted);
@@ -3506,7 +3507,7 @@ BOOST_AUTO_TEST_CASE(sender_rejected_initial_submit_releases_on_cancel)
 
             const auto cancelled = *m_service->Snapshot(id);
             BOOST_CHECK(cancelled.phase == PaymentPhase::Cancelled);
-            BOOST_CHECK(!cancelled.owns_inputs);
+            BOOST_CHECK(!cancelled.has_unreleased_reservation);
             BOOST_CHECK(!cancelled.selected);
             BOOST_CHECK(!cancelled.node_accepted);
         }
@@ -3530,7 +3531,7 @@ BOOST_AUTO_TEST_CASE(sender_disclosure_rollback_failure_is_conservative)
     BOOST_CHECK(failed.storage_uncertain);
     BOOST_CHECK(failed.possibly_exposed);
     BOOST_CHECK(failed.disclosure_saved);
-    BOOST_CHECK(failed.owns_inputs);
+    BOOST_CHECK(failed.has_unreleased_reservation);
     BOOST_CHECK(!failed.transport_accepted);
     BOOST_CHECK(m_transport->m_pending.empty());
 }
@@ -3561,7 +3562,7 @@ BOOST_AUTO_TEST_CASE(sender_not_sent_initial_completion_releases_on_cancel)
 
     const auto cancelled = *m_service->Snapshot(id);
     BOOST_CHECK(cancelled.phase == PaymentPhase::Cancelled);
-    BOOST_CHECK(!cancelled.owns_inputs);
+    BOOST_CHECK(!cancelled.has_unreleased_reservation);
     BOOST_CHECK(!cancelled.selected);
     BOOST_CHECK(!cancelled.node_accepted);
     BOOST_REQUIRE(cancelled.original);
@@ -3574,7 +3575,7 @@ BOOST_AUTO_TEST_CASE(sender_not_sent_initial_completion_releases_on_cancel)
 
     BOOST_CHECK_EQUAL(m_database->WriteCount(), writes);
     BOOST_CHECK(m_service->Snapshot(id)->phase == PaymentPhase::Cancelled);
-    BOOST_CHECK(!m_service->Snapshot(id)->owns_inputs);
+    BOOST_CHECK(!m_service->Snapshot(id)->has_unreleased_reservation);
 }
 
 BOOST_AUTO_TEST_CASE(sender_retired_not_sent_after_cancel_releases)
@@ -3591,7 +3592,7 @@ BOOST_AUTO_TEST_CASE(sender_retired_not_sent_after_cancel_releases)
 
     BOOST_REQUIRE(m_service->Snapshot(id)->phase == PaymentPhase::Cancelled);
     BOOST_REQUIRE(m_service->Snapshot(id)->possibly_exposed);
-    BOOST_REQUIRE(m_service->Snapshot(id)->owns_inputs);
+    BOOST_REQUIRE(m_service->Snapshot(id)->has_unreleased_reservation);
 
     complete({Delivery::NotSent, {}, "cancelled request was not sent"});
     Flush();
@@ -3599,7 +3600,7 @@ BOOST_AUTO_TEST_CASE(sender_retired_not_sent_after_cancel_releases)
     const auto cancelled = *m_service->Snapshot(id);
     BOOST_CHECK(cancelled.phase == PaymentPhase::Cancelled);
     BOOST_CHECK(!cancelled.possibly_exposed);
-    BOOST_CHECK(!cancelled.owns_inputs);
+    BOOST_CHECK(!cancelled.has_unreleased_reservation);
     BOOST_CHECK(ReadStoredPayment(id).released);
 
     const auto writes = m_database->WriteCount();
@@ -3630,7 +3631,7 @@ BOOST_AUTO_TEST_CASE(sender_retired_not_sent_after_deadline_waits_for_cancel)
                 Flush();
 
                 BOOST_REQUIRE(m_service->Snapshot(id)->phase == PaymentPhase::Cancelled);
-                BOOST_REQUIRE(m_service->Snapshot(id)->owns_inputs);
+                BOOST_REQUIRE(m_service->Snapshot(id)->has_unreleased_reservation);
             }
 
             complete({Delivery::NotSent, {}, "expired request was not sent"});
@@ -3643,7 +3644,7 @@ BOOST_AUTO_TEST_CASE(sender_retired_not_sent_after_deadline_waits_for_cancel)
                 BOOST_CHECK(after_completion.phase == PaymentPhase::Attention);
                 BOOST_CHECK(after_completion.issue == PaymentIssue::Deadline);
                 BOOST_CHECK_EQUAL(after_completion.diagnostic, "payment deadline reached");
-                BOOST_CHECK(after_completion.owns_inputs);
+                BOOST_CHECK(after_completion.has_unreleased_reservation);
                 BOOST_CHECK(!ReadStoredPayment(id).released);
 
                 m_service->Cancel(id);
@@ -3651,7 +3652,7 @@ BOOST_AUTO_TEST_CASE(sender_retired_not_sent_after_deadline_waits_for_cancel)
             }
 
             BOOST_CHECK(m_service->Snapshot(id)->phase == PaymentPhase::Cancelled);
-            BOOST_CHECK(!m_service->Snapshot(id)->owns_inputs);
+            BOOST_CHECK(!m_service->Snapshot(id)->has_unreleased_reservation);
             BOOST_CHECK(ReadStoredPayment(id).released);
         }
     }
@@ -3678,7 +3679,7 @@ BOOST_AUTO_TEST_CASE(sender_retired_not_sent_save_failure_keeps_reservation)
     BOOST_CHECK(failed.issue == PaymentIssue::Storage);
     BOOST_CHECK(failed.storage_uncertain);
     BOOST_CHECK(failed.possibly_exposed);
-    BOOST_CHECK(failed.owns_inputs);
+    BOOST_CHECK(failed.has_unreleased_reservation);
     BOOST_CHECK(ReadStoredPayment(id).exposed);
 }
 
@@ -3700,12 +3701,12 @@ BOOST_AUTO_TEST_CASE(sender_not_sent_disclosure_rollback_failure_preserves_reser
     BOOST_CHECK(failed.possibly_exposed);
     BOOST_CHECK(failed.disclosure_saved);
     BOOST_CHECK(ReadStoredPayment(id).exposed);
-    BOOST_CHECK(failed.owns_inputs);
+    BOOST_CHECK(failed.has_unreleased_reservation);
 
     m_service->Cancel(id);
     Flush();
 
-    BOOST_CHECK(m_service->Snapshot(id)->owns_inputs);
+    BOOST_CHECK(m_service->Snapshot(id)->has_unreleased_reservation);
     BOOST_CHECK(!m_service->Snapshot(id)->selected);
     BOOST_CHECK(!m_service->Snapshot(id)->node_accepted);
 }
@@ -3812,7 +3813,7 @@ BOOST_AUTO_TEST_CASE(sender_owner_cursor_failure_prevents_selection)
             BOOST_CHECK(!m_service->Snapshot(id)->original);
             BOOST_CHECK(!m_service->Snapshot(id)->original_saved);
             BOOST_CHECK(!m_service->Snapshot(id)->storage_uncertain);
-            BOOST_CHECK(!m_service->Snapshot(id)->owns_inputs);
+            BOOST_CHECK(!m_service->Snapshot(id)->has_unreleased_reservation);
         }
     }
 
@@ -3832,7 +3833,7 @@ BOOST_AUTO_TEST_CASE(sender_invalid_uri_and_relay_can_be_cancelled)
         BOOST_CHECK(!view.diagnostic.empty());
         BOOST_CHECK(view.diagnostic != "std::exception");
         BOOST_CHECK(!view.original_saved);
-        BOOST_CHECK(!view.owns_inputs);
+        BOOST_CHECK(!view.has_unreleased_reservation);
         BOOST_CHECK(!view.storage_uncertain);
     }
 
@@ -3846,7 +3847,7 @@ BOOST_AUTO_TEST_CASE(sender_invalid_uri_and_relay_can_be_cancelled)
         const auto view = *m_service->Snapshot(id);
         BOOST_CHECK(view.issue == PaymentIssue::Protocol || view.issue == PaymentIssue::Delivery);
         BOOST_CHECK(view.original_saved);
-        BOOST_CHECK(view.owns_inputs);
+        BOOST_CHECK(view.has_unreleased_reservation);
         BOOST_CHECK(!view.possibly_exposed);
         BOOST_CHECK(!view.disclosure_saved);
         BOOST_CHECK(!view.transport_accepted);
@@ -3856,7 +3857,7 @@ BOOST_AUTO_TEST_CASE(sender_invalid_uri_and_relay_can_be_cancelled)
         m_service->Cancel(id);
         Flush();
 
-        BOOST_CHECK(!m_service->Snapshot(id)->owns_inputs);
+        BOOST_CHECK(!m_service->Snapshot(id)->has_unreleased_reservation);
         BOOST_CHECK(!m_service->Snapshot(id)->selected);
         BOOST_CHECK(!m_service->Snapshot(id)->node_accepted);
     }
@@ -3922,7 +3923,7 @@ BOOST_AUTO_TEST_CASE(sender_mempool_refresh_preserves_delivery_diagnostic_until_
     BOOST_CHECK(published.node_accepted);
     BOOST_CHECK(!published.issue);
     BOOST_CHECK(published.diagnostic.empty());
-    BOOST_CHECK(published.owns_inputs);
+    BOOST_CHECK(published.has_unreleased_reservation);
 
     BOOST_CHECK(Journal(id).second);
     BOOST_CHECK_EQUAL(m_transport->m_attempts, 1);
@@ -3932,7 +3933,7 @@ BOOST_AUTO_TEST_CASE(sender_mempool_refresh_preserves_delivery_diagnostic_until_
     Flush();
 
     BOOST_CHECK(m_service->Snapshot(id)->phase == PaymentPhase::Confirmed);
-    BOOST_CHECK(!m_service->Snapshot(id)->owns_inputs);
+    BOOST_CHECK(!m_service->Snapshot(id)->has_unreleased_reservation);
 }
 
 BOOST_AUTO_TEST_CASE(sender_reorg_original_does_not_restore_released_ownership)
@@ -3946,7 +3947,7 @@ BOOST_AUTO_TEST_CASE(sender_reorg_original_does_not_restore_released_ownership)
     Flush();
 
     BOOST_REQUIRE(m_service->Snapshot(id)->settlement);
-    BOOST_REQUIRE(!m_service->Snapshot(id)->owns_inputs);
+    BOOST_REQUIRE(!m_service->Snapshot(id)->has_unreleased_reservation);
 
     Disconnect(block);
     for (int i = 0; i < 2; ++i) {
@@ -3960,7 +3961,7 @@ BOOST_AUTO_TEST_CASE(sender_reorg_original_does_not_restore_released_ownership)
         BOOST_CHECK(!view.settlement);
         BOOST_CHECK(view.phase == PaymentPhase::Attention);
         BOOST_CHECK(view.issue == PaymentIssue::ObservedSpend);
-        BOOST_CHECK(!view.owns_inputs);
+        BOOST_CHECK(!view.has_unreleased_reservation);
         BOOST_CHECK(!view.fallback_available);
     }
 
@@ -3993,7 +3994,7 @@ BOOST_AUTO_TEST_CASE(sender_reorg_original_does_not_restore_released_ownership)
     const auto next = m_service->Start(next_intent);
     Flush();
 
-    BOOST_REQUIRE_MESSAGE(m_service->Snapshot(next)->owns_inputs, m_service->Snapshot(next)->diagnostic);
+    BOOST_REQUIRE_MESSAGE(m_service->Snapshot(next)->has_unreleased_reservation, m_service->Snapshot(next)->diagnostic);
 
     const auto input = original->vin[0].prevout;
     m_service->Cancel(id);
@@ -4005,7 +4006,7 @@ BOOST_AUTO_TEST_CASE(sender_reorg_original_does_not_restore_released_ownership)
         auto owner = ReadOwner(input);
         BOOST_CHECK(owner == next);
         BOOST_CHECK(m_sender->IsLockedCoin(input));
-        BOOST_CHECK(!m_service->Snapshot(id)->owns_inputs);
+        BOOST_CHECK(!m_service->Snapshot(id)->has_unreleased_reservation);
     }
 
     Confirm(original);
@@ -4048,7 +4049,7 @@ BOOST_AUTO_TEST_CASE(sender_reorg_selected_preserves_uncertain_release)
         BOOST_CHECK(view.phase == PaymentPhase::Attention);
         BOOST_CHECK(view.issue == PaymentIssue::Storage);
         BOOST_CHECK(view.storage_uncertain);
-        BOOST_CHECK(view.owns_inputs);
+        BOOST_CHECK(view.has_unreleased_reservation);
         BOOST_CHECK(!view.fallback_available);
     }
 
@@ -4079,7 +4080,7 @@ BOOST_AUTO_TEST_CASE(sender_unlock_failure_keeps_release_uncertain)
 
     const auto view = *m_service->Snapshot(id);
     BOOST_CHECK(view.storage_uncertain);
-    BOOST_CHECK(view.owns_inputs);
+    BOOST_CHECK(view.has_unreleased_reservation);
     BOOST_CHECK(view.issue == PaymentIssue::Storage);
 
     const auto input = original->vin[0].prevout;
@@ -4095,7 +4096,7 @@ BOOST_AUTO_TEST_CASE(sender_unlock_failure_keeps_release_uncertain)
     Flush();
 
     BOOST_CHECK(m_service->Snapshot(id)->storage_uncertain);
-    BOOST_CHECK(m_service->Snapshot(id)->owns_inputs);
+    BOOST_CHECK(m_service->Snapshot(id)->has_unreleased_reservation);
 
     const auto stored = ReadStoredPayment(id);
     BOOST_CHECK(!stored.released);
@@ -4146,7 +4147,7 @@ void CheckStaleFallbackMarker(SenderFixture& fixture, bool persistent_failure)
         BOOST_REQUIRE(view.settlement);
         BOOST_CHECK(view.settlement->kind == SpendKind::Original);
         BOOST_CHECK(view.storage_uncertain);
-        BOOST_CHECK(view.owns_inputs);
+        BOOST_CHECK(view.has_unreleased_reservation);
         BOOST_CHECK(!view.locks_verified);
         BOOST_CHECK(view.issue == PaymentIssue::Storage);
         BOOST_CHECK(!view.diagnostic.empty());
@@ -4210,7 +4211,7 @@ BOOST_AUTO_TEST_CASE(sender_release_checks_all_owners_before_any_unlock)
 
         const auto view = *m_service->Snapshot(id);
         BOOST_CHECK(view.issue == PaymentIssue::Reservation);
-        BOOST_CHECK(view.owns_inputs);
+        BOOST_CHECK(view.has_unreleased_reservation);
         BOOST_CHECK(!view.storage_uncertain);
 
         const auto stored = ReadStoredPayment(id);
@@ -4241,7 +4242,7 @@ struct ReleaseFailureFixture : SenderFixture {
     {
         const auto view = *m_service->Snapshot(m_id);
         BOOST_CHECK(view.storage_uncertain);
-        BOOST_CHECK(view.owns_inputs);
+        BOOST_CHECK(view.has_unreleased_reservation);
         BOOST_CHECK(!view.locks_verified);
         BOOST_REQUIRE(view.original);
         auto owner = ReadOwner(view.original->vin[0].prevout);
@@ -4276,7 +4277,7 @@ BOOST_AUTO_TEST_CASE(sender_release_lost_commit_acknowledgement_preserves_uncert
     Flush();
     const auto prepared = *m_service->Snapshot(id);
     BOOST_REQUIRE(!prepared.possibly_exposed);
-    BOOST_REQUIRE(prepared.owns_inputs);
+    BOOST_REQUIRE(prepared.has_unreleased_reservation);
     {
         LOCK(m_sender->cs_wallet);
         CheckOwnedInputs(id, *prepared.original);
@@ -4290,7 +4291,7 @@ BOOST_AUTO_TEST_CASE(sender_release_lost_commit_acknowledgement_preserves_uncert
     BOOST_REQUIRE(!m_database->HasActiveTxn());
     const auto view = *m_service->Snapshot(id);
     BOOST_CHECK(view.storage_uncertain);
-    BOOST_CHECK(view.owns_inputs);
+    BOOST_CHECK(view.has_unreleased_reservation);
     BOOST_CHECK(!view.locks_verified);
     BOOST_CHECK(view.issue == PaymentIssue::Storage);
     BOOST_CHECK_EQUAL(view.diagnostic, "ownership release rollback failed");
@@ -4329,7 +4330,7 @@ BOOST_FIXTURE_TEST_CASE(sender_release_owner_erase_failure_does_not_claim_succes
     Flush();
 
     BOOST_CHECK(m_service->Snapshot(m_id)->storage_uncertain);
-    BOOST_CHECK(m_service->Snapshot(m_id)->owns_inputs);
+    BOOST_CHECK(m_service->Snapshot(m_id)->has_unreleased_reservation);
 }
 
 BOOST_FIXTURE_TEST_CASE(sender_release_abort_failure_remains_uncertain, ReleaseFailureFixture)
@@ -4367,7 +4368,7 @@ BOOST_AUTO_TEST_CASE(sender_cancel_after_reorg_observes_reconfirmation)
     Flush();
 
     BOOST_REQUIRE(m_service->Snapshot(id)->settlement);
-    BOOST_REQUIRE(!m_service->Snapshot(id)->owns_inputs);
+    BOOST_REQUIRE(!m_service->Snapshot(id)->has_unreleased_reservation);
 
     Disconnect(block);
     m_service->Refresh(id);
@@ -4387,7 +4388,7 @@ BOOST_AUTO_TEST_CASE(sender_cancel_after_reorg_observes_reconfirmation)
         BOOST_CHECK(view.original_presence == TransactionPresence::Confirmed);
         BOOST_CHECK(view.phase == PaymentPhase::Confirmed);
         BOOST_CHECK(view.settlement.has_value());
-        BOOST_CHECK(!view.owns_inputs);
+        BOOST_CHECK(!view.has_unreleased_reservation);
     }
 }
 
@@ -4432,7 +4433,7 @@ BOOST_AUTO_TEST_CASE(sender_cancel_after_original_reorg_observes_conflict)
         BOOST_REQUIRE(view.settlement);
         BOOST_CHECK(view.settlement->kind == SpendKind::Other);
         BOOST_CHECK(view.phase == PaymentPhase::Conflicted);
-        BOOST_CHECK(!view.owns_inputs);
+        BOOST_CHECK(!view.has_unreleased_reservation);
     }
 }
 
@@ -4749,7 +4750,7 @@ BOOST_AUTO_TEST_CASE(sender_cancel_after_reorg_preserves_uncertain_release)
     Flush();
 
     BOOST_CHECK(m_service->Snapshot(id)->storage_uncertain);
-    BOOST_CHECK(m_service->Snapshot(id)->owns_inputs);
+    BOOST_CHECK(m_service->Snapshot(id)->has_unreleased_reservation);
     BOOST_CHECK(m_service->Snapshot(id)->issue == PaymentIssue::Storage);
 }
 
