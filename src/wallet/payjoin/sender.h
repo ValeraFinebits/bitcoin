@@ -28,6 +28,7 @@ class SerialTaskRunner;
 namespace wallet {
 class CWallet;
 namespace payjoin {
+/** Wallet workflow state, independent of protocol outcome, reservations, and current transaction presence. */
 enum class PaymentPhase {
     Queued,
     Ready,
@@ -88,20 +89,26 @@ struct SpendObservation {
         : transaction{std::move(tx)}, kind{spend_kind}, presence{tx_presence} {}
 };
 
+/** Published wallet state. Action flags are hints; execution rechecks current conditions, including network policy. */
 struct PaymentSnapshot {
     uint256 id;
     PaymentPhase phase{PaymentPhase::Queued};
+    /** Signed original, which the receiver may broadcast after disclosure. */
     CTransactionRef original;
+    /** Transaction selected for publication; explicit fallback selects the original. */
     CTransactionRef selected;
 
     bool original_saved{false};
     bool owns_inputs{false};
 
+    /** Verification of current in-memory wallet locks, not their database persistence. */
     bool locks_verified{false};
     bool possibly_exposed{false};
+    /** A transport accepted a request; this does not establish receiver observation. */
     bool transport_accepted{false};
     bool wallet_recorded{false};
 
+    /** Last recorded publication result; consult selected_presence for current observation. */
     bool node_accepted{false};
     bool storage_uncertain{false};
 
@@ -111,13 +118,16 @@ struct PaymentSnapshot {
 
     TransactionPresence original_presence{TransactionPresence::Missing};
     TransactionPresence selected_presence{TransactionPresence::Missing};
+    /** Wallet-known mempool or confirmed spend of original inputs, including a competing transaction. */
     std::optional<SpendObservation> observed_spend;
 
+    /** Confirmed spend used for reconciliation. Original takes precedence over Selected when both transactions match. */
     std::optional<SpendObservation> settlement;
 
     std::optional<PaymentIssue> issue;
     std::string diagnostic;
 
+    /** Negotiation deadline; saved-proposal signing and publication retries have separate eligibility checks. */
     std::chrono::steady_clock::time_point deadline;
 
     bool cancel_available{false};
@@ -125,6 +135,7 @@ struct PaymentSnapshot {
     bool publication_retry_available{false};
 };
 
+/** Effective parameters fixed at registration, including resolved wallet defaults. */
 struct PaymentIntent {
     std::string uri;
     std::string relay;
@@ -135,6 +146,7 @@ struct PaymentIntent {
     std::chrono::milliseconds poll_interval{std::chrono::seconds{1}};
 };
 
+/** Parsed input, separate from effective wallet defaults for idempotency. */
 struct PaymentRequest {
     std::string uri;
     std::string relay;
@@ -163,6 +175,7 @@ enum class RequestError {
     Internal,
 };
 
+/** Validate active-chain address, amount, fee and time limits. The pinned URI parser still admits v1. */
 util::Expected<PayjoinUriInfo, std::string> ValidatePaymentIntent(const PaymentIntent& intent);
 
 enum class SenderCommand {
@@ -181,6 +194,7 @@ enum class CommandStatus {
     NotFound,
 };
 
+/** Result of one operation; refusal is separate from the payment problem. */
 struct ManagerResult {
     CommandStatus status{CommandStatus::Completed};
     std::vector<PaymentView> payments{};
@@ -190,6 +204,10 @@ struct ManagerResult {
     std::optional<CommandRefusal> refusal{};
 };
 
+/** Wallet, serial runner, and injected callback dependencies must outlive Stop().
+ * Cancel(), PublishFallback(), RetryPublication(), RetrySigning(), and Refresh()
+ * queue work without waiting for completion; use Execute() instead when a result is needed.
+ */
 class SenderService
 {
 public:
@@ -210,12 +228,21 @@ public:
 
     SenderService& operator=(const SenderService&) = delete;
 
+    /** Register a fixed intent, waiting for current execution but not preparation. */
     [[nodiscard]] uint256 Start(PaymentIntent intent);
 
+    /** Accept without waiting for preparation or its notification barrier.
+     * Dropping the future does not cancel accepted work.
+     */
     std::future<ManagerResult> Send(PaymentRequest request);
 
+    /** Refresh views in one runner task after a notification barrier.
+     * Later notifications may appear on the next read.
+     * Stop completes the read even if its barrier has not run.
+     */
     std::future<ManagerResult> Read(std::optional<uint256> id = std::nullopt);
 
+    /** Last published snapshot; does not refresh observations or wait for a notification barrier. */
     [[nodiscard]] std::optional<PaymentSnapshot> Snapshot(const uint256& id) const;
 
     void Cancel(const uint256& id);
@@ -224,16 +251,28 @@ public:
 
     void RetryPublication(const uint256& id);
 
+    /** Retry saved-proposal signing and, on success, attempt publication. */
     void RetrySigning(const uint256& id);
 
+    /** Queue observation refresh without a notification barrier. Use Read() for a barrier. */
     void Refresh(const uint256& id);
 
+    /** Return this invocation's result and post-command view asynchronously.
+     * Failed commands may have partial effects. Dropping the future does not
+     * cancel the command; Stop completes pending operations with final views.
+     */
     std::future<ManagerResult> Execute(const uint256& id, SenderCommand command);
 
+    /** Close admission without waiting for current wallet work. */
     void Close();
 
+    /** Reconcile delivery and publish all registered results before returning.
+     * No wallet locks may be held. Do not call from the service's runner.
+     * Future payment timers are not drained; exposed inputs may remain reserved.
+     */
     void Stop();
 
+    /** Immutable final views after Stop(), retaining no wallet resources; null before Stop() completes. */
     std::shared_ptr<const std::vector<PaymentView>> Archive() const;
 
 private:

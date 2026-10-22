@@ -1,24 +1,25 @@
-# Payjoin tests with upstream TestServices
+# Payjoin build and tests
 
-Native Linux tests use Core's in-process regtest wallets and actual upstream
-TestServices, without an external bitcoind or a replacement SenderSession.
+Reuse separate build directories for production and integration. See [wallet RPC](payjoin-rpc.md).
 
-| Build tree / executable | Suites | Rust FFI |
-| --- | --- | --- |
-| `build-payjoin/bin/test_bitcoin` | payjoin_tests, payjoin_sender_tests, payjoin_transport_tests | Production depends package; no _test-utils |
-| `build-payjoin-integration/bin/test_payjoin_integration` | payjoin_integration_tests | Separate _test-utils library and matching generated C++ |
+## Prerequisites
 
-Use separate build trees and FFI packages. The integration build selects test FFI
-before compiling wallet/adapter code; CMake rejects mixing test and production FFI.
-Pre-exchange tests hold requests without starting TestServices; HTTP-only cases
-need no wallet fixture. Receiver Progress establishes actual observation of original;
-transport acceptance, HTTP submission and delivery of a response are separate stages.
+Use Linux or Ubuntu WSL from the source root: CMake 3.24+, [Unix tools](build-unix.md),
+[depends prerequisites](../depends/README.md), Git, Python 3, `cargo` and `rustc` in `PATH`.
+Examples use depends curl and OpenSSL; system libcurl needs 8.22+ and async DNS. Install Rust 1.85.1:
 
-## Build and run
+```sh
+git submodule update --init --recursive -- payjoin
+rustup toolchain install 1.85.1 --profile minimal
+RUSTUP_TOOLCHAIN=1.85.1 rustc --version
+RUSTUP_TOOLCHAIN=1.85.1 cargo --version
+```
 
-Run from the source root with CMake 3.24 or newer. The commands use depends curl
-and OpenSSL; without depends, curl development version 8.22 or newer is required.
-This workflow supports Linux, including Ubuntu WSL, rather than a Windows cross-build.
+## Production FFI build and unit tests
+
+These Core builds use Debug for testing. Keep `source_dir` and `depends_prefix` in one
+shell. Prepare both FFI packages and CLI before Core; rerunning depends can recreate
+the prefix. Downloads need network; cached runs use `CARGO_NET_OFFLINE=true`.
 
 ```sh
 source_dir="$PWD"
@@ -26,78 +27,78 @@ depends_prefix="$source_dir/depends/$(./depends/config.guess)"
 make -C depends -j4 PAYJOIN=1 PAYJOIN_TESTS=1 NO_QT=1 NO_IPC=1 NO_ZMQ=1 NO_USDT=1
 cmake -S . -B build-payjoin \
   --toolchain "$depends_prefix/toolchain.cmake" \
-  -DCMAKE_BUILD_TYPE=Debug -DENABLE_PAYJOIN=ON -DBUILD_TESTS=ON \
+  -DCMAKE_BUILD_TYPE=Debug -DENABLE_WALLET=ON -DENABLE_PAYJOIN=ON -DBUILD_TESTS=ON \
   -DBUILD_PAYJOIN_INTEGRATION_TESTS=OFF -DCMAKE_COMPILE_WARNING_AS_ERROR=ON \
   -DPayjoinFFI_DIR="$depends_prefix/lib/cmake/PayjoinFFI"
-cmake --build build-payjoin --target test_bitcoin -j4
+cmake --build build-payjoin --target test_bitcoin bitcoind bitcoin-cli -j4
 ./build-payjoin/bin/test_bitcoin \
-  --run_test=payjoin_tests,payjoin_sender_tests,payjoin_transport_tests \
+  --run_test=payjoin_tests,payjoin_sender_tests,payjoin_transport_tests,payjoin_manager_tests \
   --catch_system_error=no --log_level=test_suite
 ```
 
-Both FFI packages use the installed Rust 1.85.1 toolchain, Cargo-recent.lock,
-`--locked` and the pinned native C++ generator. `payjoin_ffi` uses release without
-_test-utils; `payjoin_ffi_test` uses dev/debug with cpp,_test-utils. They share a
-recipe and use separate Cargo target directories. The generator keeps its
-existing release profile and production Cargo directory.
+Unit suites cover protocol and wallet/manager behavior. Sender tests use controlled transport;
+HTTP tests exercise libcurl against local servers.
 
-Prepare both packages before configuring either Core tree. The first invocation
-may download locked dependencies; after filling the cache, use
-`CARGO_NET_OFFLINE=true` with the same depends command for offline preparation.
-Running depends again can recreate its prefix, so do not run it between the two
-Core passes.
+## Integration build and tests
+
+Production uses release FFI without `_test-utils`; integration uses debug FFI with `cpp,_test-utils`.
+CMake enforces package separation. [Recipes](../depends/packages/payjoin_ffi.mk) pin Rust, lockfile and generator.
+Linking is static; the shared library generates bindings.
+For system dependencies, omit `--toolchain`; use prepared `PayjoinFFI_DIR`.
 
 ```sh
 cmake -S . -B build-payjoin-integration \
   --toolchain "$depends_prefix/toolchain.cmake" \
   -DCMAKE_BUILD_TYPE=Debug -DCMAKE_COMPILE_WARNING_AS_ERROR=ON \
-  -DENABLE_PAYJOIN=ON -DBUILD_TESTS=ON \
+  -DENABLE_WALLET=ON -DENABLE_PAYJOIN=ON -DBUILD_TESTS=ON \
   -DBUILD_PAYJOIN_INTEGRATION_TESTS=ON \
   -DPayjoinFFI_DIR="$depends_prefix/tests/payjoin-ffi/lib/cmake/PayjoinFFI"
-cmake --build build-payjoin-integration --target test_payjoin_integration -j4
+cmake --build build-payjoin-integration --target test_payjoin_integration payjoin_test_services -j4
 ctest --test-dir build-payjoin-integration \
   -L payjoin_integration --output-on-failure --no-tests=error -j1
 ```
 
-Production FFI is installed under the depends prefix; test FFI is under
-`tests/payjoin-ffi`, each with `lib/libpayjoin_ffi.a`, a CMake config under
-`lib/cmake/PayjoinFFI` and bindings under `share/payjoin/cpp`. The test executable
-links one static FFI archive. The Rust .so is only an intermediate for binding
-generation; no Payjoin loader environment is needed.
+Integration exchanges use in-process regtest wallets, real `SenderSession` and
+TestServices; pre-exchange and HTTP-only cases cover narrower boundaries.
+CTest runs cases in separate processes with 120-second timeouts; exit stops
+TestServices tasks. Receiver observation proves original receipt.
 
-The toolchain in these examples selects all depends libraries and is used by CI.
-Core can instead use system dependencies and a separately prepared FFI package:
-omit `--toolchain` and set `PayjoinFFI_DIR` to the appropriate config directory.
-CMake rejects the test package when integration is off, and the production
-package when integration is on. Missing bindings fail package validation or
-compilation.
-
-## Process lifetime and CI
-
-CTest discovers cases from the compiled Boost listing and runs each integration
-case in a separate process with a 120-second timeout. Upstream TestServices has a
-global Tokio runtime without shutdown: dropping its C++ handle does not abort
-spawned tasks. Process exit stops the threads/listeners; no child bitcoind is used.
-Keep the per-case process isolation and bounded HTTP/receiver waits.
-
-The existing native Payjoin job first prepares both FFI packages in depends.
-A failure preparing the test package stops the job before the ordinary pass.
-The ordinary `all` build and full CTest set use production FFI; the second Core
-tree selects the test package and runs the integration label. Both passes use
-Rust 1.85.1 and the depends toolchain. Depends is not rerun between them. Discovery failure, empty selection
-or a failed case fails the job; cases are not automatically retried.
+## Wallet RPC functional test
 
 ```sh
-FILE_ENV=ci/test/00_setup_env_native_payjoin.sh ./ci/test_run_all.sh
+python3 build-payjoin/test/functional/test_runner.py wallet_payjoin.py \
+  --payjoin-cli="$depends_prefix/native/bin/payjoin-cli" \
+  --payjoin-test-services="$source_dir/build-payjoin-integration/bin/payjoin_test_services"
 ```
 
-For a clean CI check, use an LF source snapshot with Git modes preserved and new
-build/cache directories. Keep development caches intact: Docker `--no-cache` does
-not clear named cache volumes. Downloaded dependency sources may be reused.
+Require `Passed`. Without helper paths it reports `Skipped`; supplying either requires both.
+Reload tests verify loss of RPC access and a new `request_id` scope; [recovery](payjoin-todo.md#recovery) is pending.
+The exchange uses P2WPKH; P2TR and mixed cases await a [matrix](payjoin-todo.md#transaction-compatibility).
+
+The test runs Core against an upstream CLI receiver and isolated TestServices.
+It checks the receiver input, publication, confirmation, reorg, idempotency,
+cancellation and explicit fallback. Successful CLI exit is checked before mining;
+`--timeout-factor` scales bounded waits.
+
+## BTCPay Server regtest smoke test
+
+Prerequisites: both nodes share the same regtest chain; the Core sender wallet is
+funded and unlocked; BTCPay Async Payjoin has a hot wallet with a confirmed spendable
+UTXO; the directory and OHTTP relay are reachable. Keep the sender wallet loaded.
+
+Use the [RPC workflow](payjoin-rpc.md#minimal-workflow).
+
+| Step | Action | Expected result |
+| --- | --- | --- |
+| 1 | Create an invoice, select Async Payjoin and copy the complete Bitcoin URI. | URI contains the amount and `pj=`. |
+| 2 | Call `sendpayjoin` with the URI, relay, unique `request_id` and fee cap. | A `payment_id` is returned. |
+| 3 | Repeat the request with identical parameters. | Same `payment_id`, `duplicate=true`. |
+| 4 | Poll `getpayjoin` and inspect the selected transaction. | `published`; `selected.txid` differs from `original.txid`; a receiver-owned input is present; total fee respects the cap; original is absent from the mempool. |
+| 5 | Mine enough blocks for the store's confirmation policy, poll again and check BTCPay. | `confirmed`, settlement kind `selected`, `reservations.owned=false`; invoice is Settled with the invoice amount credited and a "Settled with Payjoin" event. |
+
+Save the invoice ID, `payment_id`, selected txid, fee and a BTCPay status screenshot.
 
 ## Verification
-
-Rebuild after changing cases and obtain counts from the executable and CTest:
 
 ```sh
 ./build-payjoin/bin/test_bitcoin --list_content
@@ -108,8 +109,23 @@ python3 test/lint/lint-locale-dependence.py
 cargo run --manifest-path test/lint/test_runner/Cargo.toml
 ```
 
-Require successful exits, `No errors detected` from ordinary tests and
-`100% tests passed` from integration CTest. Run full lint with its required tools
-in a matching LF snapshot; make new files visible in that snapshot's index while
-preserving the original index. Report skipped checks and external/submodule
-failures separately from build/test results.
+Require successful exits; ordinary tests report `No errors detected`, integration CTest `100% tests passed`.
+Use [lint dependencies](../test/lint/README.md#dependencies) and LF snapshots with Git modes intact;
+report skips, external and submodule failures.
+
+## Components
+
+`SenderManager` owns serial execution and services per wallet load. `SenderService` manages
+payments, reservations, signing and publication. `SenderSession` wraps protocol and journal
+transitions through Rust FFI; transport performs HTTP requests and reports delivery.
+
+## CI
+
+CI prepares both FFI packages and CLI, then production `all`, full CTest and integration.
+Setup, discovery, empty selections and failed cases stop CI; test cases are not retried.
+Mandatory functional CSV must show `Passed`; `Skipped` fails.
+See [CI prerequisites](../ci/README.md#running-a-stage-locally).
+
+```sh
+FILE_ENV=ci/test/00_setup_env_native_payjoin.sh ./ci/test_run_all.sh
+```

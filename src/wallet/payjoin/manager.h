@@ -22,6 +22,10 @@ class CWallet;
 namespace payjoin {
 std::unique_ptr<SenderTransport> MakeDirectTransport(interfaces::Chain& chain, const ArgsManager& args);
 
+/** Owns a scheduler and serial runner for one WalletContext. The chain and
+ * arguments must outlive the manager. Stop before the node notification queue.
+ * Payments and request identifiers are scoped to one wallet load, without recovery.
+ */
 class SenderManager
 {
 public:
@@ -33,12 +37,20 @@ public:
 
     std::future<ManagerResult> Send(const std::shared_ptr<CWallet>& wallet, PaymentRequest request);
 
+    /** Perform SenderService::Read(); listing an unused load creates no service or transport. */
     std::future<ManagerResult> Read(const std::shared_ptr<CWallet>& wallet, std::optional<uint256> id = std::nullopt);
 
     std::future<ManagerResult> Execute(const std::shared_ptr<CWallet>& wallet, const uint256& id, SenderCommand command);
 
+    /** Close this load's admission and join its transport without draining
+     * future timers. No wallet or wallet-owner locks may be held.
+     */
     void Unload(const std::shared_ptr<CWallet>& wallet);
 
+    /** Unload all services and stop the scheduler before returning. Repeated calls
+     * wait for the same completion. No wallet or wallet-owner locks may be held;
+     * do not call from the manager's runner. The node notification queue must still run.
+     */
     void Stop();
 
 private:

@@ -48,6 +48,7 @@ struct PayjoinUriInfo {
     std::optional<uint64_t> amount_sats;
 };
 
+/** Parse address and amount through the FFI; active-chain and v2-only admission checks belong to the caller. */
 util::Expected<PayjoinUriInfo, PayjoinError> ParsePayjoinUri(std::string_view uri);
 
 struct SenderRequest {
@@ -192,6 +193,11 @@ public:
      * and LastError()==Internal. Do not rewrite the successful journal as Aborted.
      */
     [[nodiscard]] util::Expected<SenderResponse, PayjoinError> ProcessResponse(std::span<const unsigned char> response);
+    /**
+     * Discard the pending response context, allowing PrepareRequest() in the same
+     * phase. Return InvalidState if no request is pending. This neither cancels a
+     * transport request nor proves non-delivery; reconcile any attempt before resending.
+     */
     [[nodiscard]] util::Expected<void, PayjoinError> DiscardPendingRequest();
 
     SenderPhase Phase() const;
@@ -227,8 +233,10 @@ public:
      */
     [[nodiscard]] util::Expected<void, PayjoinError> Cancel();
     /**
-     * Close a PendingFallback session after fallback broadcast or handoff;
-     * Rust treats both as terminal fallback completion.
+     * Close PendingFallback as SenderAborted after fallback broadcast, handoff,
+     * or abandonment of an unexposed payment. This only persists workflow closure;
+     * it does not broadcast or establish non-delivery. Storage or Internal errors
+     * leave the session Unusable, possibly after a durable transition.
      */
     [[nodiscard]] util::Expected<void, PayjoinError> CloseFallback();
 

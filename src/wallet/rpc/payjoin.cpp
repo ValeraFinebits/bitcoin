@@ -217,7 +217,7 @@ RPCResult TransactionResult(std::string key, bool spend = false)
         {RPCResult::Type::STR_HEX, "wtxid", "Witness transaction identifier"},
         {RPCResult::Type::STR, "presence", "missing, inactive, mempool, abandoned, mempool_conflicted, block_conflicted, or confirmed"},
     };
-    if (spend) fields.emplace_back(RPCResult::Type::STR, "kind", "original, selected, or other");
+    if (spend) fields.emplace_back(RPCResult::Type::STR, "kind", "original, selected, or other; original takes precedence when selected is the original");
     return {RPCResult::Type::OBJ, std::move(key), true, "Current transaction observation", std::move(fields)};
 }
 
@@ -229,7 +229,7 @@ RPCResult PaymentResult(std::string key)
         "Payment in this wallet load (no restart recovery)",
         {
             {RPCResult::Type::STR_HEX, "payment_id", "Payment identifier"},
-            {RPCResult::Type::STR, "phase", "queued, ready, negotiating, cancelled, attention, published, rejected, confirmed, conflicted, or stopped"},
+            {RPCResult::Type::STR, "phase", "queued, ready, negotiating, cancelled, attention, published, rejected, confirmed, conflicted, or stopped. Confirmed may refer to the original; inspect settlement.kind"},
             {
                 RPCResult::Type::OBJ,
                 "parameters",
@@ -277,7 +277,7 @@ RPCResult PaymentResult(std::string key)
                 true,
                 "Latest payment problem, not a command result",
                 {
-                    {RPCResult::Type::STR, "code", "Stable problem category"},
+                    {RPCResult::Type::STR, "code", "Stable problem category: invalid_intent, preparation, storage, reservation, protocol, delivery, deadline, signing, publication, broadcast_disabled, or observed_spend"},
                     {RPCResult::Type::STR, "message", "Diagnostic"},
                 },
             },
@@ -342,7 +342,7 @@ RPCResult CommandResultHelp()
         {
             {RPCResult::Type::STR, "result", "completed, refused, failed, or stopped"},
             PaymentResult("payment"),
-            {RPCResult::Type::STR, "refusal", true, "Stable command refusal reason"},
+            {RPCResult::Type::STR, "refusal", true, "Stable command refusal reason: invalid_state, storage_uncertain, selected, settled, inputs_changed, or network_policy"},
             {RPCResult::Type::STR, "diagnostic", true, "Command diagnostic, when available"},
         },
     };
@@ -374,6 +374,7 @@ RPCMethod sendpayjoin()
         "sendpayjoin",
         "EXPERIMENTAL: accept an asynchronous Payjoin v2 payment for this wallet load.\n"
         "Requires local private keys, an unlocked wallet, and supported direct networking.\n"
+        "Acceptance precedes preparation, signing, and publication; later failures appear in payment.problem.\n"
         "No automatic fallback or recovery after wallet reload/restart is provided.\n"
         "Identical request_id repeats return the accepted payment before mutable admission checks.\n"
         "Null and omitted arguments are equal; an explicit default differs from an omitted default.\n",
@@ -496,6 +497,7 @@ RPCMethod retrypayjoin()
     return RPCMethod{
         "retrypayjoin",
         "EXPERIMENTAL: retry signing of a saved receiver proposal or publication of the selected transaction.\n"
+        "retry_signing attempts publication after signing succeeds.\n"
         "Does not restart preparation or negotiation. An expired negotiation deadline does not itself forbid these actions.\n",
         {
             {"payment_id", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Payment identifier in this wallet load"},

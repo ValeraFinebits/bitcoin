@@ -44,6 +44,7 @@ The following are developer notes on how to build Bitcoin Core on your native pl
 - [Dependencies](dependencies.md)
 - [macOS Build Notes](build-osx.md)
 - [Unix Build Notes](build-unix.md)
+- [Payjoin Build and Tests](payjoin-integration.md)
 - [Windows Build Notes](build-windows-native.md)
 
 Development
@@ -57,6 +58,7 @@ The Bitcoin repo's [root README](/README.md) contains relevant information on th
 - [Translation Process](translation_process.md)
 - [Translation Strings Policy](translation_strings_policy.md)
 - [JSON-RPC Interface](JSON-RPC-interface.md)
+- [Experimental Payjoin v2 Wallet RPC](payjoin-rpc.md)
 - [Unauthenticated REST Interface](REST-interface.md)
 - [BIPS](bips.md)
 - [Dnsseed Policy](dnsseed-policy.md)

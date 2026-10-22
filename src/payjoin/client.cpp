@@ -1030,9 +1030,9 @@ util::Expected<SenderSession, PayjoinError> SenderSession::Create(
     auto pj_uri = ParsePjUri(uri);
     if (!pj_uri) return util::Unexpected<PayjoinError>{std::move(pj_uri).error()};
 
-    // TODO: Before wallet integration, validate the payment address and amount
-    // against the active chain (including MoneyRange/MAX_MONEY), and replace
-    // generic PjUri acceptance with a typed BIP77/v2 FFI check.
+    // The wallet validates the payment address and amount against the active
+    // chain in ValidatePaymentIntent. This adapter has no chain context.
+    // TODO: Replace generic PjUri acceptance with a typed BIP77/v2 FFI check.
 
     auto transition = BuildInitialTransition(*psbt_base64, *pj_uri, *fee_rate);
     if (!transition) return util::Unexpected<PayjoinError>{std::move(transition).error()};
