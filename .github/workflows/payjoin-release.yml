@@ -1,0 +1,205 @@
+# Copyright (c) 2026-present The Bitcoin Core developers
+# Distributed under the MIT software license, see the accompanying
+# file COPYING or https://opensource.org/license/mit.
+
+name: Payjoin Linux release
+
+on:
+  workflow_dispatch:
+    inputs:
+      payjoin_version:
+        description: Payjoin version in the archive filename
+        required: true
+        default: 0.1.0-alpha.rc1
+        type: string
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+    working-directory: /build/bitcoin
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    container:
+      image: debian:bookworm@sha256:f9c4778ec75d6b054367315b1eb4f3992ee5866b50de6d591a33e8904cba3f17
+    env:
+      CC: gcc
+      CXX: g++
+      CARGO_HOME: /usr/local/cargo
+      RUSTUP_HOME: /usr/local/rustup
+      RUSTUP_TOOLCHAIN: 1.85.1
+      LC_ALL: C.UTF-8
+      PAYJOIN_VERSION: ${{ inputs.payjoin_version }}
+
+    steps:
+      - name: Install build tools
+        working-directory: /
+        run: |
+          apt-get update
+          apt-get install --no-install-recommends -y \
+            autoconf automake binutils bison ca-certificates curl gcc g++ \
+            git libtool make patch perl pkg-config python3 unzip xz-utils
+          cd "$RUNNER_TEMP" || exit 1
+          curl --fail --location --retry 3 -o cmake.tar.gz \
+            https://github.com/Kitware/CMake/releases/download/v3.31.6/cmake-3.31.6-linux-x86_64.tar.gz
+          echo "5a1133ff103c71eb5120e2cc3de922733e7d8a26a98ae716397e8676adb367bf  cmake.tar.gz" | sha256sum --check
+          mkdir -p /opt/cmake
+          tar -xzf cmake.tar.gz -C /opt/cmake --strip-components=1
+          echo /opt/cmake/bin >> "$GITHUB_PATH"
+          curl --fail --location --retry 3 -o rustup-init \
+            https://static.rust-lang.org/rustup/archive/1.28.1/x86_64-unknown-linux-gnu/rustup-init
+          echo "a3339fb004c3d0bb9862ba0bce001861fe5cbde9c10d16591eb3f39ee6cd3e7f  rustup-init" | sha256sum --check
+          chmod +x rustup-init
+          ./rustup-init -y --no-modify-path --profile minimal --default-toolchain "$RUSTUP_TOOLCHAIN"
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Checkout selected commit
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.sha }}
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Copy sources to fixed build path
+        working-directory: /
+        run: |
+          mkdir -p /build/bitcoin
+          cp -a --no-preserve=ownership "$GITHUB_WORKSPACE/." /build/bitcoin/
+
+      - name: Prepare archive name
+        run: |
+          [[ $PAYJOIN_VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]]
+          major=$(sed -nE 's/^set\(CLIENT_VERSION_MAJOR ([0-9]+)\)$/\1/p' CMakeLists.txt)
+          minor=$(sed -nE 's/^set\(CLIENT_VERSION_MINOR ([0-9]+)\)$/\1/p' CMakeLists.txt)
+          [[ $major =~ ^[0-9]+$ && $minor =~ ^[0-9]+$ ]]
+          echo "DISTNAME=bitcoin-$major.$minor-payjoin-$PAYJOIN_VERSION-x86_64-linux-gnu" >> "$GITHUB_ENV"
+          echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)" >> "$GITHUB_ENV"
+          git rev-parse HEAD
+          git submodule status --recursive
+
+      - name: Build Release binaries
+        run: |
+          test "$(pwd -P)" = /build/bitcoin
+          maps="-ffile-prefix-map=/build/bitcoin=. -fdebug-prefix-map=/build/bitcoin=."
+          export RUSTFLAGS="--remap-path-prefix=/build/bitcoin=."
+          export CARGO_BUILD_JOBS="$(nproc)"
+          make -C depends -j"$(nproc)" \
+            PAYJOIN=1 PAYJOIN_TESTS= DEBUG= NO_QT=1 NO_IPC=1 NO_ZMQ=1 NO_USDT=1 \
+            "CC=$CC" "CXX=$CXX" "linux_CFLAGS=$maps" "linux_CXXFLAGS=$maps"
+          prefix="/build/bitcoin/depends/$(depends/config.guess)"
+          cmake -S . -B build --toolchain "$prefix/toolchain.cmake" \
+            -DCMAKE_BUILD_TYPE=Release \
+            "-DCMAKE_C_FLAGS=$maps" "-DCMAKE_CXX_FLAGS=$maps" \
+            "-DCMAKE_EXE_LINKER_FLAGS=-static-libstdc++ -static-libgcc" \
+            -DENABLE_WALLET=ON -DENABLE_PAYJOIN=ON -DENABLE_IPC=OFF \
+            -DBUILD_DAEMON=ON -DBUILD_CLI=ON -DBUILD_WALLET_TOOL=ON \
+            -DBUILD_TX=ON -DBUILD_UTIL=ON -DBUILD_BITCOIN_BIN=OFF -DBUILD_GUI=OFF \
+            -DBUILD_TESTS=OFF -DBUILD_PAYJOIN_INTEGRATION_TESTS=OFF \
+            -DBUILD_BENCH=OFF -DBUILD_FUZZ_BINARY=OFF -DINSTALL_MAN=OFF \
+            "-DPayjoinFFI_DIR=$prefix/lib/cmake/PayjoinFFI"
+          cmake --build build --parallel "$(nproc)" \
+            --target bitcoind bitcoin-cli bitcoin-wallet bitcoin-tx bitcoin-util
+
+      - name: Create binary archive
+        id: archive
+        run: |
+          umask 0022
+          stage="$RUNNER_TEMP/package/$DISTNAME"
+          for binary in bitcoind bitcoin-cli bitcoin-wallet bitcoin-tx bitcoin-util; do
+            cmake --install build --prefix "$stage" --component "$binary" --strip
+          done
+          cp COPYING "$stage/"
+          mkdir -p dist
+          archive="dist/$DISTNAME.tar.gz"
+          tar --sort=name --mtime="@$SOURCE_DATE_EPOCH" --owner=0 --group=0 --numeric-owner \
+            --mode='u+rw,go+r-w,a+X' -C "$RUNNER_TEMP/package" -cf - "$DISTNAME" | gzip -n > "$archive"
+          gzip -t "$archive"
+          python3 - "$archive" <<'PY'
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+          import sys
+          import tarfile
+          import tempfile
+
+          def check_dynamic(binary, name):
+              dynamic = subprocess.check_output(["readelf", "--dynamic", "--wide", str(binary)], text=True)
+              if re.search(r"\((RPATH|RUNPATH)\)", dynamic):
+                  sys.exit(f"{name}: unexpected RPATH or RUNPATH")
+              if not re.search(r"\(FLAGS_1\).*\bPIE\b", dynamic):
+                  sys.exit(f"{name}: missing PIE flag")
+              if not re.search(r"\(BIND_NOW\)|\(FLAGS\).*\bBIND_NOW\b|\(FLAGS_1\).*\bNOW\b", dynamic):
+                  sys.exit(f"{name}: missing BIND_NOW")
+              allowed_libraries = {
+                  "libc.so.6", "libpthread.so.0", "libm.so.6", "libdl.so.2",
+                  "librt.so.1", "libutil.so.1", "ld-linux-x86-64.so.2",
+              }
+              libraries = set(re.findall(r"\(NEEDED\).*Shared library: \[([^\]]+)\]", dynamic))
+              if "libc.so.6" not in libraries or libraries - allowed_libraries:
+                  sys.exit(f"{name}: unexpected shared libraries: {sorted(libraries)}")
+
+          names = ("bitcoind", "bitcoin-cli", "bitcoin-wallet", "bitcoin-tx", "bitcoin-util")
+          distname = os.environ["DISTNAME"]
+          expected = {distname: 0o755, f"{distname}/bin": 0o755, f"{distname}/COPYING": 0o644}
+          expected.update({f"{distname}/bin/{name}": 0o755 for name in names})
+          with open(sys.argv[1], "rb") as compressed:
+              header = compressed.read(10)
+          if len(header) != 10 or header[:4] != b"\x1f\x8b\x08\x00" or header[4:8] != bytes(4):
+              sys.exit("archive: unexpected gzip header or timestamp")
+          with tempfile.TemporaryDirectory(prefix="payjoin-archive-", dir=os.environ["RUNNER_TEMP"]) as unpacked:
+              with tarfile.open(sys.argv[1], "r:gz") as archive:
+                  members = archive.getmembers()
+                  if [member.name for member in members] != sorted(expected):
+                      sys.exit("archive: unexpected contents, duplicate entries or file order")
+                  for member in members:
+                      is_directory = member.name in (distname, f"{distname}/bin")
+                      if not (member.isdir() if is_directory else member.isreg()):
+                          sys.exit(f"archive: unexpected file type: {member.name}")
+                      if (member.uid, member.gid, member.uname, member.gname) != (0, 0, "", ""):
+                          sys.exit(f"archive: unexpected ownership: {member.name}")
+                      if member.mode != expected[member.name] or member.mtime != int(os.environ["SOURCE_DATE_EPOCH"]):
+                          sys.exit(f"archive: unexpected mode or timestamp: {member.name}")
+                  # Only the exact regular files and directories above can be extracted.
+                  archive.extractall(unpacked)
+              binary_dir = Path(unpacked) / distname / "bin"
+              for name in names:
+                  binary = binary_dir / name
+                  header = subprocess.check_output(["readelf", "--file-header", "--wide", str(binary)], text=True)
+                  if not all(re.search(pattern, header) for pattern in (
+                      r"Class:\s+ELF64", r"Data:\s+2's complement, little endian",
+                      r"Machine:\s+Advanced Micro Devices X86-64", r"Type:\s+DYN\b",
+                  )):
+                      sys.exit(f"{name}: expected an x86_64 Linux PIE executable")
+                  program = subprocess.check_output(["readelf", "--program-headers", "--wide", str(binary)], text=True)
+                  if "[Requesting program interpreter: /lib64/ld-linux-x86-64.so.2]" not in program:
+                      sys.exit(f"{name}: unexpected ELF interpreter")
+                  segments = [line.split() for line in program.splitlines() if line.split()]
+                  stacks = [segment for segment in segments if segment[0] == "GNU_STACK"]
+                  if len(stacks) != 1 or "E" in "".join(stacks[0][6:-1]):
+                      sys.exit(f"{name}: missing or executable GNU_STACK")
+                  if not any(segment[0] == "GNU_RELRO" for segment in segments):
+                      sys.exit(f"{name}: missing GNU_RELRO")
+                  for segment in segments:
+                      flags = "".join(segment[6:-1])
+                      if segment[0] == "LOAD" and "W" in flags and "E" in flags:
+                          sys.exit(f"{name}: writable and executable LOAD segment")
+                  check_dynamic(binary, name)
+                  print(f"{name}: ELF hardening and shared library checks passed", flush=True)
+                  subprocess.run([str(binary), "-version"], env={**os.environ, "LD_BIND_NOW": "1"}, check=True)
+          print("Archive contents, metadata and five extracted binaries verified", flush=True)
+          PY
+          sha256sum "$archive"
+          echo "path=/build/bitcoin/$archive" >> "$GITHUB_OUTPUT"
+
+      - name: Upload binary archive
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          path: ${{ steps.archive.outputs.path }}
+          archive: false
+          if-no-files-found: error
