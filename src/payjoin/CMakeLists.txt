@@ -2,6 +2,11 @@
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or https://opensource.org/license/mit/.
 
+include(${CMAKE_CURRENT_LIST_DIR}/version.cmake)
+target_compile_definitions(bitcoin_clientversion PRIVATE
+  "PAYJOIN_RELEASE_VERSION=\"${PAYJOIN_RELEASE_VERSION}\""
+)
+
 add_library(bitcoin_payjoin_ffi STATIC
   client.cpp
   http_transport.cpp
