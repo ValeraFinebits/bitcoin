@@ -6,12 +6,6 @@ name: Payjoin Linux release
 
 on:
   workflow_dispatch:
-    inputs:
-      payjoin_version:
-        description: Payjoin version in the archive filename
-        required: true
-        default: 0.1.0-alpha.rc1
-        type: string
 
 permissions:
   contents: read
@@ -34,7 +28,6 @@ jobs:
       RUSTUP_HOME: /usr/local/rustup
       RUSTUP_TOOLCHAIN: 1.85.1
       LC_ALL: C.UTF-8
-      PAYJOIN_VERSION: ${{ inputs.payjoin_version }}
 
     steps:
       - name: Install build tools
@@ -73,11 +66,23 @@ jobs:
 
       - name: Prepare archive name
         run: |
-          [[ $PAYJOIN_VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]]
+          payjoin_version=$(python3 - <<'PY'
+          from pathlib import Path
+          import re
+          import sys
+
+          source = Path("src/payjoin/version.cmake").read_text()
+          assignments = re.findall(r"(?m)^[ \t]*set\s*\(\s*PAYJOIN_RELEASE_VERSION\b[^\r\n]*", source)
+          match = re.fullmatch(r'\s*set\(PAYJOIN_RELEASE_VERSION "([^"\r\n]+)"\)\s*', assignments[0]) if len(assignments) == 1 else None
+          if not match or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?", match[1]):
+              sys.exit("expected exactly one valid PAYJOIN_RELEASE_VERSION")
+          print(match[1])
+          PY
+          )
           major=$(sed -nE 's/^set\(CLIENT_VERSION_MAJOR ([0-9]+)\)$/\1/p' CMakeLists.txt)
           minor=$(sed -nE 's/^set\(CLIENT_VERSION_MINOR ([0-9]+)\)$/\1/p' CMakeLists.txt)
           [[ $major =~ ^[0-9]+$ && $minor =~ ^[0-9]+$ ]]
-          echo "DISTNAME=bitcoin-$major.$minor-payjoin-$PAYJOIN_VERSION-x86_64-linux-gnu" >> "$GITHUB_ENV"
+          echo "DISTNAME=bitcoin-$major.$minor-payjoin-$payjoin_version-x86_64-linux-gnu" >> "$GITHUB_ENV"
           echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)" >> "$GITHUB_ENV"
           git rev-parse HEAD
           git submodule status --recursive
@@ -120,13 +125,64 @@ jobs:
             --mode='u+rw,go+r-w,a+X' -C "$RUNNER_TEMP/package" -cf - "$DISTNAME" | gzip -n > "$archive"
           gzip -t "$archive"
           python3 - "$archive" <<'PY'
+          import json
           import os
           from pathlib import Path
           import re
+          import socket
           import subprocess
           import sys
           import tarfile
           import tempfile
+          import time
+
+          source_dir = Path.cwd()
+          core_source = (source_dir / "CMakeLists.txt").read_text()
+          core = {}
+          for part in ("MAJOR", "MINOR", "BUILD", "RC"):
+              values = re.findall(rf"(?m)^set\(CLIENT_VERSION_{part} ([0-9]+)\)$", core_source)
+              if len(values) != 1:
+                  sys.exit(f"expected exactly one CLIENT_VERSION_{part}")
+              core[part] = int(values[0])
+          release = re.findall(r'(?m)^set\(CLIENT_VERSION_IS_RELEASE "?(true|false)"?\)$', core_source, re.IGNORECASE)
+          if len(release) != 1:
+              sys.exit("expected exactly one CLIENT_VERSION_IS_RELEASE")
+          source = (source_dir / "src/payjoin/version.cmake").read_text()
+          assignments = re.findall(r"(?m)^[ \t]*set\s*\(\s*PAYJOIN_RELEASE_VERSION\b[^\r\n]*", source)
+          match = re.fullmatch(r'\s*set\(PAYJOIN_RELEASE_VERSION "([^"\r\n]+)"\)\s*', assignments[0]) if len(assignments) == 1 else None
+          if not match or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?", match[1]):
+              sys.exit("expected exactly one valid PAYJOIN_RELEASE_VERSION")
+          payjoin_version = match[1]
+
+          def git(*args):
+              return subprocess.run(["git", *args], cwd=source_dir, text=True, capture_output=True, timeout=30)
+
+          # Match GenerateBuildInfo.cmake using the tags actually available here.
+          suffix = None
+          source_tarball = re.search(r"(?m)^set\(IS_SOURCE_TARBALL TRUE\)$", (source_dir / "src/CMakeLists.txt").read_text())
+          if not source_tarball and git("rev-parse", "--is-inside-work-tree").stdout.strip() == "true":
+              git("diff")  # Refresh touched files before diff-index, as the generator does.
+              tag = git("describe", "--abbrev=0").stdout.strip()
+              tag_commit = git("rev-list", "-1", *([tag] if tag else [])).stdout.strip()
+              head = git("rev-parse", "HEAD")
+              dirty = git("diff-index", "--quiet", "HEAD", "--")
+              if head.returncode or dirty.returncode not in (0, 1):
+                  sys.exit("cannot determine build checkout state")
+              if head.stdout.strip() == tag_commit and not dirty.returncode:
+                  suffix = ""
+              else:
+                  commit = git("rev-parse", "--short=12", "HEAD")
+                  if commit.returncode or not re.fullmatch(r"[0-9a-f]+", commit.stdout.strip()):
+                      sys.exit("cannot determine build commit")
+                  suffix = "-" + commit.stdout.strip() + ("-dirty" if dirty.returncode else "")
+          if release[0].lower() == "true":
+              suffix = ""
+          elif suffix is None:
+              exported = re.findall(r'(?m)^#define GIT_COMMIT_ID "([0-9a-f]+)"$', (source_dir / "src/clientversion.cpp").read_text())
+              suffix = "-g" + exported[0] if len(exported) == 1 else "-unk"
+          core_version = f'{core["MAJOR"]}.{core["MINOR"]}.{core["BUILD"]}'
+          full_core_version = core_version + (f'rc{core["RC"]}' if core["RC"] > 0 else "")
+          expected_version = f"v{full_core_version}-payjoin-{payjoin_version}{suffix}"
 
           def check_dynamic(binary, name):
               dynamic = subprocess.check_output(["readelf", "--dynamic", "--wide", str(binary)], text=True)
@@ -146,6 +202,8 @@ jobs:
 
           names = ("bitcoind", "bitcoin-cli", "bitcoin-wallet", "bitcoin-tx", "bitcoin-util")
           distname = os.environ["DISTNAME"]
+          if distname != f'bitcoin-{core["MAJOR"]}.{core["MINOR"]}-payjoin-{payjoin_version}-x86_64-linux-gnu':
+              sys.exit("archive name does not match the source versions")
           expected = {distname: 0o755, f"{distname}/bin": 0o755, f"{distname}/COPYING": 0o644}
           expected.update({f"{distname}/bin/{name}": 0o755 for name in names})
           with open(sys.argv[1], "rb") as compressed:
@@ -167,7 +225,7 @@ jobs:
                           sys.exit(f"archive: unexpected mode or timestamp: {member.name}")
                   # Only the exact regular files and directories above can be extracted.
                   archive.extractall(unpacked)
-              binary_dir = Path(unpacked) / distname / "bin"
+              binary_dir = (Path(unpacked) / distname / "bin").resolve()
               for name in names:
                   binary = binary_dir / name
                   header = subprocess.check_output(["readelf", "--file-header", "--wide", str(binary)], text=True)
@@ -191,8 +249,67 @@ jobs:
                           sys.exit(f"{name}: writable and executable LOAD segment")
                   check_dynamic(binary, name)
                   print(f"{name}: ELF hardening and shared library checks passed", flush=True)
-                  subprocess.run([str(binary), "-version"], env={**os.environ, "LD_BIND_NOW": "1"}, check=True)
-          print("Archive contents, metadata and five extracted binaries verified", flush=True)
+                  result = subprocess.run([str(binary), "-version"], env={**os.environ, "LD_BIND_NOW": "1"},
+                                          check=True, capture_output=True, text=True, timeout=30)
+                  first_line = result.stdout.splitlines()[0] if result.stdout else ""
+                  token = re.search(r"\bversion\s+(\S+)", first_line)
+                  if not token or token[1] != expected_version:
+                      sys.exit(f"{name}: unexpected version: {first_line!r}; expected {expected_version}")
+                  print(f"{name}: {first_line}", flush=True)
+
+              with tempfile.TemporaryDirectory(prefix="payjoin-rpc-", dir=os.environ["RUNNER_TEMP"]) as isolated:
+                  isolated = Path(isolated).resolve()
+                  home, datadir, conf = isolated / "home", isolated / "data", isolated / "bitcoin.conf"
+                  home.mkdir()
+                  datadir.mkdir()
+                  conf.write_text("")
+                  env = {**os.environ, "HOME": str(home), "LD_BIND_NOW": "1"}
+                  with socket.socket() as reservation:
+                      reservation.bind(("127.0.0.1", 0))
+                      rpc_port = reservation.getsockname()[1]
+                  common = [f"-datadir={datadir}", f"-conf={conf}", "-regtest", f"-rpcport={rpc_port}"]
+                  cli = [str(binary_dir / "bitcoin-cli"), *common, "-rpcconnect=127.0.0.1", "-rpcclienttimeout=5"]
+                  with (isolated / "bitcoind.log").open("w+") as log:
+                      node = subprocess.Popen([str(binary_dir / "bitcoind"), *common, "-server", "-networkactive=0",
+                                               "-listen=0", "-dnsseed=0", "-discover=0", "-fixedseeds=0",
+                                               "-rpcbind=127.0.0.1", "-rpcallowip=127.0.0.1"],
+                                              env=env, stdout=log, stderr=subprocess.STDOUT)
+                      try:
+                          deadline = time.monotonic() + 60
+                          while True:
+                              result = subprocess.run([*cli, "getnetworkinfo"], env=env, capture_output=True, text=True, timeout=10)
+                              if result.returncode == 0:
+                                  info = json.loads(result.stdout)
+                                  break
+                              if node.poll() is not None or time.monotonic() >= deadline:
+                                  log.seek(0)
+                                  sys.exit(f"isolated regtest RPC did not start: {result.stderr}\n{log.read()}")
+                              time.sleep(0.1)
+                          expected_numeric = 10000 * core["MAJOR"] + 100 * core["MINOR"] + core["BUILD"]
+                          if info["version"] != expected_numeric or info["subversion"] != f"/Satoshi:{core_version}/":
+                              sys.exit(f"unexpected getnetworkinfo version: {info['version']}, {info['subversion']}")
+                          if info["networkactive"]:
+                              sys.exit("isolated regtest P2P networking is active")
+                          print(f"RPC versions verified: {info['version']}, {info['subversion']}", flush=True)
+                      finally:
+                          if node.poll() is None:
+                              try:
+                                  subprocess.run([*cli, "stop"], env=env, capture_output=True, text=True, timeout=10)
+                              finally:
+                                  try:
+                                      node.wait(timeout=30)
+                                  except subprocess.TimeoutExpired:
+                                      node.terminate()
+                                      try:
+                                          node.wait(timeout=10)
+                                      except subprocess.TimeoutExpired:
+                                          node.kill()
+                                          node.wait(timeout=10)
+                          else:
+                              node.wait(timeout=10)
+                      if node.returncode != 0:
+                          sys.exit(f"isolated regtest exited with status {node.returncode}")
+          print("Archive contents, metadata, five extracted versions and RPC verified", flush=True)
           PY
           sha256sum "$archive"
           echo "path=/build/bitcoin/$archive" >> "$GITHUB_OUTPUT"

@@ -32,11 +32,17 @@ const std::string UA_NAME("Satoshi");
 // git will expand the next line to "#define GIT_COMMIT_ID ..." inside archives:
 //$Format:%n#define GIT_COMMIT_ID "%H"$
 
-#ifdef BUILD_GIT_TAG
+#ifdef ENABLE_PAYJOIN
+    #define BUILD_DESC "v" CLIENT_VERSION_STRING "-payjoin-" PAYJOIN_RELEASE_VERSION
+#elif defined(BUILD_GIT_TAG)
     #define BUILD_DESC BUILD_GIT_TAG
-    #define BUILD_SUFFIX ""
 #else
     #define BUILD_DESC "v" CLIENT_VERSION_STRING
+#endif
+
+#ifdef BUILD_GIT_TAG
+    #define BUILD_SUFFIX ""
+#else
     #if CLIENT_VERSION_IS_RELEASE
         #define BUILD_SUFFIX ""
     #elif defined(BUILD_GIT_COMMIT)
