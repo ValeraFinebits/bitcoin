@@ -457,7 +457,7 @@ void CheckFinalProposalFeeRate(IntegrationFixture& fixture, bool sufficient)
     CMutableTransaction funding;
     funding.vin.emplace_back(COutPoint{fixture.m_receiver_coin->GetHash(), 0});
     funding.vout.emplace_back(fixture.m_receiver_coin->vout[0].nValue - 1000, receiver_script);
-    PartiallySignedTransaction funding_psbt{funding, 0};
+    PartiallySignedTransaction funding_psbt{funding, /*psbt_version=*/0};
     bool complete{false};
     {
         LOCK(fixture.m_receiver->cs_wallet);
