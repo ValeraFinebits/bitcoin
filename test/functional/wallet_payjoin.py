@@ -27,7 +27,10 @@ class PayjoinTest(BitcoinTestFramework):
         self.num_nodes = 1
         self.setup_clean_chain = True
         self.wallet_names = []
-        self.extra_args = [["-fallbackfee=0.00001", "-addresstype=bech32", "-changetype=bech32", "-deprecatedrpc=bip125"]]
+        self.extra_args = [[
+            "-fallbackfee=0.00001", "-addresstype=bech32", "-changetype=bech32",
+            "-deprecatedrpc=bip125", "-deprecatedrpc=iswatchonly",
+        ]]
 
     def add_options(self, parser):
         parser.add_argument("--payjoin-cli", help="Path to the pinned upstream payjoin-cli executable")
