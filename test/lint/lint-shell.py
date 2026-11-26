@@ -31,7 +31,10 @@ def get_shebang_files():
     reg = re.compile(rb"^#!.*\b(?:sh|bash)\b")
     shebang_files = []
 
-    for file in get_files(["git", "ls-files"]):
+    for entry in get_files(["git", "ls-files", "--stage"]):
+        metadata, file = entry.split("\t", 1)
+        if metadata.split()[0] == "160000":
+            continue
         with open(file, "rb") as script:
             if reg.match(script.readline()):
                 shebang_files.append(file)
